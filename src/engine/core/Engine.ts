@@ -41,6 +41,8 @@ interface InventoryLayout {
   gridY: number;
 }
 
+type NpcState = 'idle' | 'chase';
+
 const ASCII_RAMP = ' .:-=+*#%@';
 
 const NEAR = 0.5;
@@ -63,6 +65,15 @@ const PLAYER_MAX_HP = 100;
 const NPC_MAX_HP = 100;
 const TARGET_UI_RANGE = 8;
 
+const NPC_START_X = 6;
+const NPC_START_Z = -4;
+const NPC_CHASE_RANGE = 12;
+const NPC_ATTACK_RANGE = 1.8;
+const NPC_STOP_DISTANCE = 1.2;
+const NPC_SPEED = 3.5;
+const NPC_ATTACK_DAMAGE = 10;
+const NPC_ATTACK_COOLDOWN = 1;
+
 const GRAVITY = 9.8;
 const SPARK_MIN = 5;
 const SPARK_MAX = 8;
@@ -71,6 +82,7 @@ const INDICATOR_LIFE = 0.9;
 const PARTICLE_DEPTH_BIAS = 0.3;
 const MAX_PARTICLES = 512;
 const SPARK_COLORS: string[] = ['#ffffff', '#ffee55', '#ffd028'];
+const BLOOD_COLORS: string[] = ['#ff0000', '#ff2020', '#ff5555'];
 
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
 const NPC_RGB: Rgb = { r: 255, g: 40, b: 160 };
@@ -86,12 +98,14 @@ const PANEL_PAD_TOP = 3;
 const PANEL_PAD_BOTTOM = 4;
 const DIM_FACTOR = 0.3;
 
+const HP_BAR_COL = 21;
+const HP_BAR_WIDTH = 16;
+
 const INV_PANEL_BG = '#000f08';
 const INV_SLOT_HOVER_BG = '#0a3a2a';
 const INV_BORDER = '#1f8a62';
 const INV_BORDER_HOVER = '#ffffff';
 const INV_TITLE = '#00ff9c';
-// const INV_TEXT = '#2a7a5a';
 const INV_INFO = '#00d4ff';
 
 export class Engine {
@@ -105,6 +119,9 @@ export class Engine {
   private readonly npcPos: Vector3;
   private npcHealth: number;
   private npcHitTimer: number;
+  private npcState: NpcState;
+  private npcAttackCooldown: number;
+  private npcFacing: number;
 
   private readonly particles: Particle[];
 
@@ -141,9 +158,12 @@ export class Engine {
     this.facing = 0;
     this.playerHealth = PLAYER_MAX_HP;
 
-    this.npcPos = new Vector3(6, 0, -4);
+    this.npcPos = new Vector3(NPC_START_X, 0, NPC_START_Z);
     this.npcHealth = NPC_MAX_HP;
     this.npcHitTimer = 0;
+    this.npcState = 'idle';
+    this.npcAttackCooldown = 0;
+    this.npcFacing = 0;
 
     this.particles = [];
 
@@ -246,13 +266,18 @@ export class Engine {
     return Math.abs(x - this.npcPos.x) < limit && Math.abs(z - this.npcPos.z) < limit;
   }
 
+  private npcCollidesWithPlayer(x: number, z: number): boolean {
+    const limit = CUBE_HALF * 2;
+    return Math.abs(x - this.playerPos.x) < limit && Math.abs(z - this.playerPos.z) < limit;
+  }
+
   private distanceToNpc(): number {
     const dx = this.npcPos.x - this.playerPos.x;
     const dz = this.npcPos.z - this.playerPos.z;
     return Math.sqrt(dx * dx + dz * dz);
   }
 
-  private spawnHitEffect(pos: Vector3): void {
+  private spawnHitEffect(pos: Vector3, colors: string[]): void {
     const origin = new Vector3(pos.x, pos.y + CUBE_HALF * 2, pos.z);
     const count = SPARK_MIN + Math.floor(Math.random() * (SPARK_MAX - SPARK_MIN + 1));
 
@@ -267,7 +292,7 @@ export class Engine {
         life,
         maxLife: life,
         char: '*',
-        color: SPARK_COLORS[Math.floor(Math.random() * SPARK_COLORS.length)] ?? '#ffffff',
+        color: colors[Math.floor(Math.random() * colors.length)] ?? '#ffffff',
         gravity: GRAVITY,
       });
     }
@@ -310,6 +335,62 @@ export class Engine {
         p.vel.z *= 0.5;
       }
     }
+  }
+
+  private updateNpc(dt: number): void {
+    if (!this.npcAlive()) return;
+
+    if (this.npcAttackCooldown > 0) this.npcAttackCooldown = Math.max(0, this.npcAttackCooldown - dt);
+
+    const dist = this.distanceToNpc();
+    this.npcState = dist < NPC_CHASE_RANGE ? 'chase' : 'idle';
+    if (this.npcState !== 'chase') return;
+
+    const toX = this.playerPos.x - this.npcPos.x;
+    const toZ = this.playerPos.z - this.npcPos.z;
+    const dir = new Vector3(toX, 0, toZ).normalize();
+
+    if (dist > NPC_STOP_DISTANCE) {
+      const nextX = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.npcPos.x + dir.x * NPC_SPEED * dt));
+      if (!this.npcCollidesWithPlayer(nextX, this.npcPos.z)) this.npcPos.x = nextX;
+
+      const nextZ = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.npcPos.z + dir.z * NPC_SPEED * dt));
+      if (!this.npcCollidesWithPlayer(this.npcPos.x, nextZ)) this.npcPos.z = nextZ;
+    } else {
+      const push = (NPC_STOP_DISTANCE - dist) * 0.5;
+      this.npcPos.x -= dir.x * push;
+      this.npcPos.z -= dir.z * push;
+    }
+
+    const target = Math.atan2(dir.x, dir.z);
+    let diff = target - this.npcFacing;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    this.npcFacing += diff * (1 - Math.exp(-10 * dt));
+
+    if (this.distanceToNpc() < NPC_ATTACK_RANGE && this.npcAttackCooldown <= 0) {
+      this.playerHealth = Math.max(0, this.playerHealth - NPC_ATTACK_DAMAGE);
+      this.npcAttackCooldown = NPC_ATTACK_COOLDOWN;
+      this.spawnHitEffect(this.playerPos, BLOOD_COLORS);
+    }
+  }
+
+  private respawn(): void {
+    this.playerHealth = PLAYER_MAX_HP;
+    this.playerPos.x = 0;
+    this.playerPos.y = 0;
+    this.playerPos.z = 0;
+    this.facing = 0;
+    this.cameraPos = this.playerPos.add(this.cameraOffset);
+
+    this.npcHealth = NPC_MAX_HP;
+    this.npcPos.x = NPC_START_X;
+    this.npcPos.y = 0;
+    this.npcPos.z = NPC_START_Z;
+    this.npcState = 'idle';
+    this.npcAttackCooldown = 0;
+    this.npcHitTimer = 0;
+    this.npcFacing = 0;
   }
 
   private getInventoryLayout(): InventoryLayout {
@@ -390,12 +471,16 @@ export class Engine {
       if (this.distanceToNpc() < ATTACK_RANGE) {
         this.npcHealth = Math.max(0, this.npcHealth - ATTACK_DAMAGE);
         this.npcHitTimer = HIT_FLASH_TIME;
-        this.spawnHitEffect(this.npcPos);
+        this.spawnHitEffect(this.npcPos, SPARK_COLORS);
       }
     }
     this.input.actionJustPressed = false;
 
     if (this.npcHitTimer > 0) this.npcHitTimer = Math.max(0, this.npcHitTimer - dt);
+
+    this.updateNpc(dt);
+
+    if (this.playerHealth <= 0) this.respawn();
 
     this.updateParticles(dt);
 
@@ -419,7 +504,7 @@ export class Engine {
     this.drawFloor(viewProj);
     if (this.npcAlive()) {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
-      this.drawCube(viewProj, this.npcPos, 0, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
+      this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
     }
     this.drawCube(viewProj, this.playerPos, this.facing, {
       r: PLAYER_RGB.r * dim,
@@ -652,7 +737,15 @@ export class Engine {
       `POS: X ${this.playerPos.x.toFixed(1)}  Z ${this.playerPos.z.toFixed(1)}`,
       '#00d4ff'
     );
-    r.drawRawText(1, 2, `PLAYER HP: ${this.playerHealth}/${PLAYER_MAX_HP}`, '#00ff9c');
+
+    const ratio = Math.max(0, Math.min(1, this.playerHealth / PLAYER_MAX_HP));
+    const filled = Math.round(ratio * HP_BAR_WIDTH);
+    const hpColor = ratio > 0.5 ? '#00ff9c' : ratio > 0.25 ? '#ffd028' : '#ff2020';
+    r.drawRawText(1, 2, `PLAYER HP: ${this.playerHealth}/${PLAYER_MAX_HP}`, hpColor);
+    r.drawRawText(HP_BAR_COL, 2, '[', '#2a7a5a');
+    r.drawRawText(HP_BAR_COL + 1, 2, '#'.repeat(filled), hpColor);
+    r.drawRawText(HP_BAR_COL + 1 + filled, 2, '-'.repeat(HP_BAR_WIDTH - filled), '#1f3a30');
+    r.drawRawText(HP_BAR_COL + 1 + HP_BAR_WIDTH, 2, ']', '#2a7a5a');
 
     if (this.npcAlive()) {
       if (this.distanceToNpc() < TARGET_UI_RANGE) {
