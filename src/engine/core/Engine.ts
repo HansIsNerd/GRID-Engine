@@ -15,9 +15,17 @@ const ASCII_RAMP = ' .:-=+*#%@';
 /** Anything with w <= NEAR is at/behind the camera plane and is clipped. */
 const NEAR = 0.5;
 const FAR = 100;
+const FOV = Math.PI / 3; // vertical field of view
 
-const GRID_HALF = 20; // floor grid spans -20..20 on X and Z
+const GRID_HALF = 40; // CHANGED: floor grid spans -40..40 on X and Z
 const MOVE_SPEED = 6; // world units per second
+
+// CHANGED: Project Zomboid style camera (pitch -60 deg)
+const CAMERA_PITCH = -Math.PI / 3;
+const CAMERA_HEIGHT = 10;
+
+/** CHANGED: number of brightness steps in the pre-built fog palettes. */
+const FOG_LEVELS = 24;
 
 export class Engine {
   private readonly renderer: AsciiRenderer;
@@ -27,11 +35,19 @@ export class Engine {
   private readonly playerPos: Vector3;
   private facing: number; // rotation around Y (radians), purely cosmetic
 
-  // ---- Camera state (fixed top-down) -------------------------------------
+  // ---- Camera state ------------------------------------------------------
   private readonly pitch: number;
   private readonly yaw: number;
   private readonly cameraOffset: Vector3;
   private cameraPos: Vector3;
+
+  // ---- CHANGED: fog of war -----------------------------------------------
+  /** View depth (W) where the fog begins: the player's depth, so the player's surroundings stay bright. */
+  private readonly fogStart: number;
+  /** View depth where the floor is fully black: just before the top screen edge. */
+  private readonly fogEnd: number;
+  private readonly majorPalette: string[];
+  private readonly minorPalette: string[];
 
   // ---- Cube model (unit cube centered on the origin) ---------------------
   private readonly cubeVertices: Vector3[];
@@ -52,10 +68,31 @@ export class Engine {
     this.playerPos = new Vector3(0, 0, 0);
     this.facing = 0;
 
-    this.pitch = -Math.PI / 4; // look down 45 degrees
+    // CHANGED: camera offset is derived from pitch + height, so they can't disagree.
+    // Looking down by `tilt`, the camera sits CAMERA_HEIGHT up and
+    // CAMERA_HEIGHT / tan(tilt) behind the player (+Z).
+    this.pitch = CAMERA_PITCH;
     this.yaw = 0;
-    this.cameraOffset = new Vector3(0, 8, 8);
+    const tilt = -this.pitch;
+    const backDist = CAMERA_HEIGHT / Math.tan(tilt);
+    this.cameraOffset = new Vector3(0, CAMERA_HEIGHT, backDist);
     this.cameraPos = this.playerPos.add(this.cameraOffset);
+
+    // CHANGED: fog range from camera geometry.
+    // View depth of a floor point d units ahead (horizontally) of the camera:
+    //   w = dot(point - cam, forward) = H*sin(tilt) + d*cos(tilt)
+    // Player: d = backDist.  Top screen edge: its ray points (tilt - FOV/2)
+    // below the horizontal, so it hits the floor at d = H / tan(tilt - FOV/2).
+    const playerDepth = CAMERA_HEIGHT * Math.sin(tilt) + backDist * Math.cos(tilt);
+    const topAngle = tilt - FOV / 2;
+    const topDepth =
+      topAngle > 0.05
+        ? CAMERA_HEIGHT * Math.sin(tilt) + (CAMERA_HEIGHT / Math.tan(topAngle)) * Math.cos(tilt)
+        : FAR; // horizon visible: fall back to the far plane
+    this.fogStart = playerDepth;
+    this.fogEnd = Math.max(playerDepth + 1, topDepth * 0.95);
+    this.majorPalette = Engine.buildPalette(150);
+    this.minorPalette = Engine.buildPalette(70);
 
     const h = 0.5;
     this.cubeVertices = [
@@ -83,6 +120,20 @@ export class Engine {
     this.lastTime = 0;
     this.fps = 60;
     this.running = false;
+  }
+
+  /**
+   * CHANGED: pre-builds FOG_LEVELS colors, from near-black to full brightness.
+   * Fading to black = scaling the RGB channels towards rgb(0,0,0).
+   * Doing this once avoids creating a color string for every pixel.
+   */
+  private static buildPalette(base: number): string[] {
+    const out: string[] = [];
+    for (let i = 0; i < FOG_LEVELS; i++) {
+      const f = (i + 1) / FOG_LEVELS;
+      out.push(`rgb(0,${Math.floor(base * f)},${Math.floor(base * 0.7 * f)})`);
+    }
+    return out;
   }
 
   public start(): void {
@@ -126,6 +177,7 @@ export class Engine {
       const dir = new Vector3(dx, 0, dz).normalize(); // no faster diagonals
       this.playerPos.x += dir.x * MOVE_SPEED * dt;
       this.playerPos.z += dir.z * MOVE_SPEED * dt;
+      // World-bounds AABB (the only collision box in the engine right now).
       this.playerPos.x = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.x));
       this.playerPos.z = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.z));
 
@@ -139,7 +191,7 @@ export class Engine {
     }
 
     // --- Camera follows the player ----------------------------------------
-    // Exponential smoothing: independent of the frame rate, unlike a fixed lerp factor.
+    // Exponential smoothing: independent of the frame rate.
     const desired = this.playerPos.add(this.cameraOffset);
     const k = 1 - Math.exp(-8 * dt);
     this.cameraPos = this.cameraPos.add(desired.subtract(this.cameraPos).multiply(k));
@@ -155,26 +207,22 @@ export class Engine {
     // ---------------------------------------------------------------------
     // TOP-DOWN CAMERA MATH
     //
-    // A camera is just the inverse of an object placed in the world. Instead
-    // of moving a camera we move the WORLD in the opposite way:
+    // A camera is the inverse of an object placed in the world, so instead of
+    // moving the camera we move the WORLD the opposite way:
     //
-    //   1. trans = translation(-cameraPos)
-    //        Puts the camera at the origin.
-    //   2. rotY(-yaw)   (identity here, yaw = 0)
-    //        Undoes the camera's left/right turn.
-    //   3. rotX(-pitch)
-    //        pitch = -45deg means the camera is tilted DOWN. We rotate the
-    //        world by +45deg around X so that this tilt becomes "straight
-    //        ahead". Example: the player is at (0,-8,-8) relative to the
-    //        camera; after rotX(+45deg): y' = y*cos - z*sin = 0,
-    //        z' = y*sin + z*cos = -11.3  ->  centered, 11.3 units in front
-    //        (the camera looks down -Z).
-    //   4. proj
-    //        Perspective: w = -z, so x/w and y/w shrink with distance.
+    //   1. trans = translation(-cameraPos)   camera -> origin
+    //   2. rotY(-yaw)                        undo left/right turn (identity)
+    //   3. rotX(-pitch)                      undo the downward tilt.
+    //        pitch = -60deg. Example: the player is at (0,-10,-5.77) relative
+    //        to the camera; after rotX(+60deg):
+    //          y' = y*cos - z*sin = -5 + 5     = 0
+    //          z' = y*sin + z*cos = -8.66-2.89 = -11.55
+    //        -> centered, 11.55 units straight ahead (camera looks down -Z).
+    //   4. proj                              w = -z, so x/w and y/w shrink with distance.
     //
     //   viewProj = proj * rotX * rotY * trans   (rightmost is applied first)
     // ---------------------------------------------------------------------
-    const proj = Matrix4.perspective(Math.PI / 3, r.getAspect(), NEAR, FAR);
+    const proj = Matrix4.perspective(FOV, r.getAspect(), NEAR, FAR);
     const rotX = Matrix4.rotationX(-this.pitch);
     const rotY = Matrix4.rotationY(-this.yaw);
     const trans = Matrix4.translation(-this.cameraPos.x, -this.cameraPos.y, -this.cameraPos.z);
@@ -191,7 +239,6 @@ export class Engine {
    * Clip space -> grid cells.
    *   ndc = clip.xy / clip.w          (perspective divide, range -1..1)
    *   cells: x = (ndc.x*0.5+0.5)*cols ;  y = (1 - (ndc.y*0.5+0.5))*rows
-   * (Screen Y points DOWN, NDC Y points UP, hence the flip.)
    * z is kept as W: view-space distance, always > 0 after near clipping.
    */
   private toScreen(c: Vec4): ScreenVertex {
@@ -224,8 +271,15 @@ export class Engine {
 
   /**
    * Projects a 3D line segment and draws it with perspective-correct depth.
-   * The segment is clipped against the near plane first: W is a LINEAR function
-   * of the world position, so we can find the cut point with simple lerp.
+   * Near-plane clipping first: W is LINEAR in world position, so the cut
+   * point is a simple lerp.
+   *
+   * CHANGED: FOG OF WAR. The fade is evaluated PER PIXEL from the pixel's own
+   * depth (via the `shade` callback), not once per line:
+   *
+   *   fade = 1 - (w - fogStart) / (fogEnd - fogStart)    clamped to 0..1
+   *   fade <= 0  -> pixel skipped (pure void)
+   *   color      -> base color * fade (mixes towards rgb(0,0,0))
    */
   private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, major: boolean): void {
     let ca = viewProj.transformPointWithW(a);
@@ -240,18 +294,38 @@ export class Engine {
       cb = viewProj.transformPointWithW(b.add(a.subtract(b).multiply(t)));
     }
 
+    // CHANGED: W is linear along the segment, so if BOTH ends are past the
+    // fog, every pixel is black -> skip the whole line.
+    if (ca.w >= this.fogEnd && cb.w >= this.fogEnd) return;
+
     const sa = this.toScreen(ca);
     const sb = this.toScreen(cb);
 
-    // Fade with distance for atmosphere (green/cyan, darker far away).
-    const avgW = (sa.z + sb.z) * 0.5;
-    const fade = Math.max(0.15, 1 - avgW / 40);
-    const base = major ? 150 : 70;
-    const color = `rgb(0,${Math.floor(base * fade)},${Math.floor(base * 0.7 * fade)})`;
+    // CHANGED: per-pixel fog shader.
+    const palette = major ? this.majorPalette : this.minorPalette;
+    const fogStart = this.fogStart;
+    const invRange = 1 / (this.fogEnd - this.fogStart);
+    const shade = (z: number): string | null => {
+      const fade = 1 - (z - fogStart) * invRange;
+      if (fade <= 0) return null; // beyond the fog: draw nothing
+      const idx = Math.min(FOG_LEVELS - 1, Math.floor(Math.min(1, fade) * FOG_LEVELS));
+      return palette[idx] ?? null;
+    };
+    const fallback = palette[FOG_LEVELS - 1] ?? '#00ff9c'; // unused while `shade` is given
 
     // Small depth bias pushes the floor slightly "behind" so the cube's base wins.
     const bias = 0.02;
-    this.renderer.drawLine(sa.x, sa.y, sb.x, sb.y, major ? '+' : '.', color, sa.z + bias, sb.z + bias);
+    this.renderer.drawLine(
+      sa.x,
+      sa.y,
+      sb.x,
+      sb.y,
+      major ? '+' : '.',
+      fallback,
+      sa.z + bias,
+      sb.z + bias,
+      shade
+    );
   }
 
   // ---- Player cube -------------------------------------------------------
@@ -308,13 +382,11 @@ export class Engine {
     }
   }
 
-  // ---- Triangle rasterizer ----------------------------------------------
+  // ---- Triangle rasterizer (UNCHANGED) -------------------------------------
   /**
    * Barycentric rasterizer with PERSPECTIVE-CORRECT depth.
-   *
-   * Why 1/z? Perspective projection is not linear in screen space, but 1/z IS.
-   * So we interpolate 1/z with the barycentric weights and invert it at the end.
-   * (Interpolating z directly makes surfaces "swim" and break the Z-buffer.)
+   * 1/z is linear in screen space, so we interpolate 1/z with the barycentric
+   * weights and invert it at the end.
    */
   private drawTriangle(p0: ScreenVertex, p1: ScreenVertex, p2: ScreenVertex, char: string, color: string): void {
     const area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
@@ -357,6 +429,12 @@ export class Engine {
   // ---- UI ------------------------------------------------------------------
   private drawUI(): void {
     const r = this.renderer;
+
+    // CHANGED: solid black panel (40 x 4 cells) BEHIND the text. fillRect also
+    // clears the grid characters underneath, so nothing shows through.
+    r.fillRect(0, 0, 40, 4, '#000000');
+
+    // Text is drawn AFTER the panel, inside it.
     r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
     r.drawRawText(
       1,

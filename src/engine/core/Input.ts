@@ -1,51 +1,57 @@
 export class Input {
-  private readonly keys: Set<string>;
+  public forward: boolean = false;
+  public backward: boolean = false;
+  public left: boolean = false;
+  public right: boolean = false;
 
-  private readonly onKeyDown: (e: KeyboardEvent) => void;
-  private readonly onKeyUp: (e: KeyboardEvent) => void;
-  private readonly onBlur: () => void;
+  private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (this.setKey(e.code, true)) e.preventDefault();
+  };
+
+  private readonly onKeyUp = (e: KeyboardEvent): void => {
+    if (this.setKey(e.code, false)) e.preventDefault();
+  };
+
+  private readonly onBlur = (): void => {
+    this.forward = false;
+    this.backward = false;
+    this.left = false;
+    this.right = false;
+  };
 
   constructor() {
-    this.keys = new Set<string>();
-
-    this.onKeyDown = (e: KeyboardEvent): void => {
-      this.keys.add(e.code);
-      if (e.code.startsWith('Arrow')) e.preventDefault(); // don't scroll the page
-    };
-    this.onKeyUp = (e: KeyboardEvent): void => {
-      this.keys.delete(e.code);
-    };
-    // Losing window focus swallows keyup events, so clear to avoid stuck keys.
-    this.onBlur = (): void => {
-      this.keys.clear();
-    };
-
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onBlur);
   }
 
-  public isDown(code: string): boolean {
-    return this.keys.has(code);
-  }
-
-  public get forward(): boolean {
-    return this.isDown('KeyW') || this.isDown('ArrowUp');
-  }
-  public get backward(): boolean {
-    return this.isDown('KeyS') || this.isDown('ArrowDown');
-  }
-  public get left(): boolean {
-    return this.isDown('KeyA') || this.isDown('ArrowLeft');
-  }
-  public get right(): boolean {
-    return this.isDown('KeyD') || this.isDown('ArrowRight');
+  /** Returns true if the key is one we handle. */
+  private setKey(code: string, down: boolean): boolean {
+    switch (code) {
+      case 'KeyW':
+      case 'ArrowUp':
+        this.forward = down;
+        return true;
+      case 'KeyS':
+      case 'ArrowDown':
+        this.backward = down;
+        return true;
+      case 'KeyA':
+      case 'ArrowLeft':
+        this.left = down;
+        return true;
+      case 'KeyD':
+      case 'ArrowRight':
+        this.right = down;
+        return true;
+      default:
+        return false;
+    }
   }
 
   public dispose(): void {
     window.removeEventListener('keydown', this.onKeyDown);
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onBlur);
-    this.keys.clear();
   }
 }

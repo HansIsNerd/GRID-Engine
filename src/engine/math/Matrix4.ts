@@ -1,6 +1,5 @@
 import { Vector3 } from './Vector3';
 
-/** Homogeneous (clip-space) point. */
 export interface Vec4 {
   x: number;
   y: number;
@@ -9,134 +8,111 @@ export interface Vec4 {
 }
 
 /**
- * Matrix4 — 4x4 matrix in COLUMN-MAJOR order (OpenGL standard).
- *
- * Memory layout (index = column * 4 + row):
- *
- *     | m[0] m[4] m[8]  m[12] |      m[12], m[13], m[14] = translation
- *     | m[1] m[5] m[9]  m[13] |
- *     | m[2] m[6] m[10] m[14] |
- *     | m[3] m[7] m[11] m[15] |
- *
- * We use column vectors, so a point is transformed as  p' = M * p,
- * and a chain "A then B then C" is written  C * B * A.
+ * 4x4 matrix, COLUMN-MAJOR: element (row r, column c) lives at elements[c * 4 + r].
+ * Translation therefore sits at indices 12, 13, 14.
  */
 export class Matrix4 {
-  public readonly m: Float64Array;
+  public readonly elements: Float32Array;
 
   constructor() {
-    this.m = new Float64Array(16);
-    this.m[0] = 1;
-    this.m[5] = 1;
-    this.m[10] = 1;
-    this.m[15] = 1;
+    this.elements = new Float32Array(16);
+    this.elements[0] = 1;
+    this.elements[5] = 1;
+    this.elements[10] = 1;
+    this.elements[15] = 1;
   }
 
-  private get(i: number): number {
-    return this.m[i] ?? 0;
-  }
-
-  public static identity(): Matrix4 {
-    return new Matrix4();
-  }
-
-  /** Returns this * other  (other is applied FIRST, this is applied second). */
+  /** Returns this * other (other is applied first when transforming a point). */
   public multiply(other: Matrix4): Matrix4 {
+    const a = this.elements;
+    const b = other.elements;
     const out = new Matrix4();
+    const o = out.elements;
     for (let c = 0; c < 4; c++) {
       for (let r = 0; r < 4; r++) {
         let sum = 0;
         for (let k = 0; k < 4; k++) {
-          sum += this.get(k * 4 + r) * other.get(c * 4 + k);
+          sum += a[k * 4 + r] * b[c * 4 + k];
         }
-        out.m[c * 4 + r] = sum;
+        o[c * 4 + r] = sum;
       }
     }
     return out;
   }
 
-  public static translation(x: number, y: number, z: number): Matrix4 {
-    const r = new Matrix4();
-    r.m[12] = x;
-    r.m[13] = y;
-    r.m[14] = z;
-    return r;
-  }
-
-  /** Rotation around the X axis (used for the camera pitch). */
   public static rotationX(angle: number): Matrix4 {
+    const m = new Matrix4();
     const c = Math.cos(angle);
     const s = Math.sin(angle);
-    const r = new Matrix4();
-    // y' = c*y - s*z ;  z' = s*y + c*z
-    r.m[5] = c;
-    r.m[6] = s;
-    r.m[9] = -s;
-    r.m[10] = c;
-    return r;
+    m.elements[5] = c;
+    m.elements[6] = s;
+    m.elements[9] = -s;
+    m.elements[10] = c;
+    return m;
   }
 
-  /** Rotation around the Y axis (camera yaw / player facing). */
   public static rotationY(angle: number): Matrix4 {
+    const m = new Matrix4();
     const c = Math.cos(angle);
     const s = Math.sin(angle);
-    const r = new Matrix4();
-    // x' = c*x + s*z ;  z' = -s*x + c*z
-    r.m[0] = c;
-    r.m[2] = -s;
-    r.m[8] = s;
-    r.m[10] = c;
-    return r;
+    m.elements[0] = c;
+    m.elements[2] = -s;
+    m.elements[8] = s;
+    m.elements[10] = c;
+    return m;
   }
 
-  /**
-   * OpenGL-style perspective projection.
-   * The camera looks down -Z. The matrix puts  w_clip = -z_view  (the distance
-   * in front of the camera), so dividing by w later gives the "far things look
-   * smaller" effect.
-   *
-   * @param fovY   vertical field of view in radians
-   * @param aspect PHYSICAL width/height of the screen (not columns/rows!)
-   */
+  public static translation(x: number, y: number, z: number): Matrix4 {
+    const m = new Matrix4();
+    m.elements[12] = x;
+    m.elements[13] = y;
+    m.elements[14] = z;
+    return m;
+  }
+
+  public static scaling(x: number, y: number, z: number): Matrix4 {
+    const m = new Matrix4();
+    m.elements[0] = x;
+    m.elements[5] = y;
+    m.elements[10] = z;
+    return m;
+  }
+
+  /** Right-handed perspective, camera looks down -Z, resulting w = -z_view (positive distance). */
   public static perspective(fovY: number, aspect: number, near: number, far: number): Matrix4 {
-    const f = 1 / Math.tan(fovY / 2);
-    const nf = 1 / (near - far);
-    const r = new Matrix4();
-    r.m[0] = f / aspect;
-    r.m[5] = f;
-    r.m[10] = (far + near) * nf;
-    r.m[11] = -1; // <- copies -z into w
-    r.m[14] = 2 * far * near * nf;
-    r.m[15] = 0;
-    return r;
+    const m = new Matrix4();
+    const e = m.elements;
+    const f = 1.0 / Math.tan(fovY / 2);
+    e[0] = f / aspect;
+    e[5] = f;
+    e[10] = (far + near) / (near - far);
+    e[11] = -1;
+    e[14] = (2 * far * near) / (near - far);
+    e[15] = 0;
+    return m;
   }
 
   /**
-   * Transforms a point (w assumed 1) and returns only X,Y,Z.
-   * Meant for affine matrices (rotation/translation): world-space vertices,
-   * normals and lighting. NO perspective divide happens here.
+   * Affine transform of a point (w assumed 1, NO perspective divide).
+   * Use this for world-space positions, normals and lighting.
    */
   public transformPoint(v: Vector3): Vector3 {
-    const m = this;
+    const e = this.elements;
     return new Vector3(
-      m.get(0) * v.x + m.get(4) * v.y + m.get(8) * v.z + m.get(12),
-      m.get(1) * v.x + m.get(5) * v.y + m.get(9) * v.z + m.get(13),
-      m.get(2) * v.x + m.get(6) * v.y + m.get(10) * v.z + m.get(14)
+      e[0] * v.x + e[4] * v.y + e[8] * v.z + e[12],
+      e[1] * v.x + e[5] * v.y + e[9] * v.z + e[13],
+      e[2] * v.x + e[6] * v.y + e[10] * v.z + e[14]
     );
   }
 
-  /**
-   * Transforms a point and keeps the 4th component W.
-   * Used with the projection matrix: the caller divides x,y by w to get
-   * normalized device coordinates, and uses 1/w for perspective-correct depth.
-   */
+  /** Full 4D transform. Use this for screen projection and the Z-buffer (w = view depth). */
   public transformPointWithW(v: Vector3): Vec4 {
-    const m = this;
+    const e = this.elements;
     return {
-      x: m.get(0) * v.x + m.get(4) * v.y + m.get(8) * v.z + m.get(12),
-      y: m.get(1) * v.x + m.get(5) * v.y + m.get(9) * v.z + m.get(13),
-      z: m.get(2) * v.x + m.get(6) * v.y + m.get(10) * v.z + m.get(14),
-      w: m.get(3) * v.x + m.get(7) * v.y + m.get(11) * v.z + m.get(15),
+      x: e[0] * v.x + e[4] * v.y + e[8] * v.z + e[12],
+      y: e[1] * v.x + e[5] * v.y + e[9] * v.z + e[13],
+      z: e[2] * v.x + e[6] * v.y + e[10] * v.z + e[14],
+      w: e[3] * v.x + e[7] * v.y + e[11] * v.z + e[15],
     };
   }
 }
