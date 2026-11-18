@@ -3,13 +3,15 @@ export class Input {
   public backward: boolean = false;
   public left: boolean = false;
   public right: boolean = false;
+  public action: boolean = false;
+  public actionJustPressed: boolean = false;
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (this.setKey(e.code, true)) e.preventDefault();
+    if (this.setKey(e.code, true, e.repeat)) e.preventDefault();
   };
 
   private readonly onKeyUp = (e: KeyboardEvent): void => {
-    if (this.setKey(e.code, false)) e.preventDefault();
+    if (this.setKey(e.code, false, false)) e.preventDefault();
   };
 
   private readonly onBlur = (): void => {
@@ -17,6 +19,8 @@ export class Input {
     this.backward = false;
     this.left = false;
     this.right = false;
+    this.action = false;
+    this.actionJustPressed = false;
   };
 
   constructor() {
@@ -25,8 +29,7 @@ export class Input {
     window.addEventListener('blur', this.onBlur);
   }
 
-  /** Returns true if the key is one we handle. */
-  private setKey(code: string, down: boolean): boolean {
+  private setKey(code: string, down: boolean, repeat: boolean): boolean {
     switch (code) {
       case 'KeyW':
       case 'ArrowUp':
@@ -44,6 +47,10 @@ export class Input {
       case 'ArrowRight':
         this.right = down;
         return true;
+      case 'Space':
+        if (down && !this.action && !repeat) this.actionJustPressed = true;
+        this.action = down;
+        return true;
       default:
         return false;
     }
@@ -54,4 +61,4 @@ export class Input {
     window.removeEventListener('keyup', this.onKeyUp);
     window.removeEventListener('blur', this.onBlur);
   }
-}
+}   
