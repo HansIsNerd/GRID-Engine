@@ -25,6 +25,22 @@ interface Particle {
   gravity: number;
 }
 
+interface InventoryItem {
+  name: string;
+  char: string;
+  color: string;
+  detail: string;
+}
+
+interface InventoryLayout {
+  panelX: number;
+  panelY: number;
+  panelW: number;
+  panelH: number;
+  gridX: number;
+  gridY: number;
+}
+
 const ASCII_RAMP = ' .:-=+*#%@';
 
 const NEAR = 0.5;
@@ -60,6 +76,24 @@ const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
 const NPC_RGB: Rgb = { r: 255, g: 40, b: 160 };
 const FLASH_RGB: Rgb = { r: 255, g: 255, b: 255 };
 
+const INV_COLS = 4;
+const INV_ROWS = 3;
+const SLOT_W = 9;
+const SLOT_H = 5;
+const SLOT_GAP = 1;
+const PANEL_PAD_X = 3;
+const PANEL_PAD_TOP = 3;
+const PANEL_PAD_BOTTOM = 4;
+const DIM_FACTOR = 0.3;
+
+const INV_PANEL_BG = '#000f08';
+const INV_SLOT_HOVER_BG = '#0a3a2a';
+const INV_BORDER = '#1f8a62';
+const INV_BORDER_HOVER = '#ffffff';
+const INV_TITLE = '#00ff9c';
+// const INV_TEXT = '#2a7a5a';
+const INV_INFO = '#00d4ff';
+
 export class Engine {
   private readonly renderer: AsciiRenderer;
   private readonly input: Input;
@@ -74,6 +108,10 @@ export class Engine {
 
   private readonly particles: Particle[];
 
+  private isInventoryOpen: boolean;
+  private readonly inventoryItems: Array<InventoryItem | null>;
+  private hoverSlot: number;
+
   private readonly pitch: number;
   private readonly yaw: number;
   private readonly cameraOffset: Vector3;
@@ -83,6 +121,8 @@ export class Engine {
   private readonly fogEnd: number;
   private readonly majorPalette: string[];
   private readonly minorPalette: string[];
+  private readonly dimMajorPalette: string[];
+  private readonly dimMinorPalette: string[];
 
   private readonly cubeVertices: Vector3[];
   private readonly cubeFaces: number[][];
@@ -107,6 +147,16 @@ export class Engine {
 
     this.particles = [];
 
+    this.isInventoryOpen = false;
+    this.hoverSlot = -1;
+    this.inventoryItems = new Array<InventoryItem | null>(INV_COLS * INV_ROWS).fill(null);
+    this.inventoryItems[0] = { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12' };
+    this.inventoryItems[1] = { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP' };
+    this.inventoryItems[2] = { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 120' };
+    this.inventoryItems[5] = { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 MP' };
+    this.inventoryItems[7] = { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6' };
+    this.inventoryItems[10] = { name: 'Ancient Key', char: 'k', color: '#b266ff', detail: 'Opens something' };
+
     this.pitch = CAMERA_PITCH;
     this.yaw = 0;
     const tilt = -this.pitch;
@@ -124,6 +174,8 @@ export class Engine {
     this.fogEnd = Math.max(playerDepth + 1, topDepth * 0.95);
     this.majorPalette = Engine.buildPalette(150);
     this.minorPalette = Engine.buildPalette(70);
+    this.dimMajorPalette = Engine.buildPalette(150 * DIM_FACTOR);
+    this.dimMinorPalette = Engine.buildPalette(70 * DIM_FACTOR);
 
     const h = CUBE_HALF;
     this.cubeVertices = [
@@ -260,7 +312,57 @@ export class Engine {
     }
   }
 
+  private getInventoryLayout(): InventoryLayout {
+    const r = this.renderer;
+    const gridW = INV_COLS * SLOT_W + (INV_COLS - 1) * SLOT_GAP;
+    const gridH = INV_ROWS * SLOT_H + (INV_ROWS - 1) * SLOT_GAP;
+    const panelW = gridW + PANEL_PAD_X * 2;
+    const panelH = gridH + PANEL_PAD_TOP + PANEL_PAD_BOTTOM;
+    const panelX = Math.floor((r.cols - panelW) / 2);
+    const panelY = Math.floor((r.rows - panelH) / 2);
+    return {
+      panelX,
+      panelY,
+      panelW,
+      panelH,
+      gridX: panelX + PANEL_PAD_X,
+      gridY: panelY + PANEL_PAD_TOP,
+    };
+  }
+
+  private slotAtMouse(): number {
+    const r = this.renderer;
+    const layout = this.getInventoryLayout();
+    const col = Math.floor((this.input.mouseX - r.offsetX) / r.charW);
+    const row = Math.floor((this.input.mouseY - r.offsetY) / r.charH);
+
+    const gx = col - layout.gridX;
+    const gy = row - layout.gridY;
+    if (gx < 0 || gy < 0) return -1;
+
+    const sc = Math.floor(gx / (SLOT_W + SLOT_GAP));
+    const sr = Math.floor(gy / (SLOT_H + SLOT_GAP));
+    if (sc >= INV_COLS || sr >= INV_ROWS) return -1;
+
+    if (gx - sc * (SLOT_W + SLOT_GAP) >= SLOT_W) return -1;
+    if (gy - sr * (SLOT_H + SLOT_GAP) >= SLOT_H) return -1;
+
+    return sr * INV_COLS + sc;
+  }
+
   private update(dt: number): void {
+    if (this.input.inventoryJustPressed) {
+      this.isInventoryOpen = !this.isInventoryOpen;
+      this.hoverSlot = -1;
+    }
+    this.input.inventoryJustPressed = false;
+
+    if (this.isInventoryOpen) {
+      this.hoverSlot = this.slotAtMouse();
+      this.input.actionJustPressed = false;
+      return;
+    }
+
     let dx = 0;
     let dz = 0;
     if (this.input.forward) dz -= 1;
@@ -312,24 +414,32 @@ export class Engine {
     const trans = Matrix4.translation(-this.cameraPos.x, -this.cameraPos.y, -this.cameraPos.z);
     const viewProj = proj.multiply(rotX).multiply(rotY).multiply(trans);
 
+    const dim = this.isInventoryOpen ? DIM_FACTOR : 1;
+
     this.drawFloor(viewProj);
     if (this.npcAlive()) {
-      const npcColor = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
-      this.drawCube(viewProj, this.npcPos, 0, npcColor);
+      const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
+      this.drawCube(viewProj, this.npcPos, 0, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
     }
-    this.drawCube(viewProj, this.playerPos, this.facing, PLAYER_RGB);
+    this.drawCube(viewProj, this.playerPos, this.facing, {
+      r: PLAYER_RGB.r * dim,
+      g: PLAYER_RGB.g * dim,
+      b: PLAYER_RGB.b * dim,
+    });
     this.drawParticles(viewProj);
     this.drawUI();
+    if (this.isInventoryOpen) this.drawInventory();
 
     r.present();
   }
 
   private drawParticles(viewProj: Matrix4): void {
+    const dimmed = this.isInventoryOpen;
     for (const p of this.particles) {
       const clip = viewProj.transformPointWithW(p.pos);
       if (clip.w <= NEAR) continue;
       const s = this.toScreen(clip);
-      this.renderer.drawChar(s.x, s.y, p.char, p.color, s.z - PARTICLE_DEPTH_BIAS);
+      this.renderer.drawChar(s.x, s.y, p.char, dimmed ? '#0a3a2a' : p.color, s.z - PARTICLE_DEPTH_BIAS);
     }
   }
 
@@ -368,7 +478,14 @@ export class Engine {
     const sa = this.toScreen(ca);
     const sb = this.toScreen(cb);
 
-    const palette = major ? this.majorPalette : this.minorPalette;
+    const dimmed = this.isInventoryOpen;
+    const palette = major
+      ? dimmed
+        ? this.dimMajorPalette
+        : this.majorPalette
+      : dimmed
+        ? this.dimMinorPalette
+        : this.minorPalette;
     const fogStart = this.fogStart;
     const invRange = 1 / (this.fogEnd - this.fogStart);
     const shade = (z: number): string | null => {
@@ -474,10 +591,59 @@ export class Engine {
     }
   }
 
+  private drawInventory(): void {
+    const r = this.renderer;
+    const layout = this.getInventoryLayout();
+    const horizontal = '+' + '-'.repeat(SLOT_W - 2) + '+';
+    const middle = '|' + ' '.repeat(SLOT_W - 2) + '|';
+
+    r.fillRect(layout.panelX, layout.panelY, layout.panelW, layout.panelH, INV_PANEL_BG);
+
+    const title = '[ INVENTORY ]';
+    r.drawRawText(
+      layout.panelX + Math.floor((layout.panelW - title.length) / 2),
+      layout.panelY + 1,
+      title,
+      INV_TITLE
+    );
+
+    for (let i = 0; i < INV_COLS * INV_ROWS; i++) {
+      const sc = i % INV_COLS;
+      const sr = Math.floor(i / INV_COLS);
+      const sx = layout.gridX + sc * (SLOT_W + SLOT_GAP);
+      const sy = layout.gridY + sr * (SLOT_H + SLOT_GAP);
+      const hovered = i === this.hoverSlot;
+
+      if (hovered) r.fillRect(sx, sy, SLOT_W, SLOT_H, INV_SLOT_HOVER_BG);
+
+      const border = hovered ? INV_BORDER_HOVER : INV_BORDER;
+      r.drawRawText(sx, sy, horizontal, border);
+      for (let row = 1; row < SLOT_H - 1; row++) {
+        r.drawRawText(sx, sy + row, middle, border);
+      }
+      r.drawRawText(sx, sy + SLOT_H - 1, horizontal, border);
+
+      const item = this.inventoryItems[i];
+      if (item) {
+        r.drawRawText(sx + Math.floor(SLOT_W / 2), sy + Math.floor(SLOT_H / 2), item.char, item.color);
+      }
+    }
+
+    const infoY = layout.panelY + layout.panelH - 2;
+    const hovered = this.hoverSlot >= 0 ? this.inventoryItems[this.hoverSlot] : null;
+    if (hovered) {
+      const text = `${hovered.name} - ${hovered.detail}`;
+      r.drawRawText(layout.panelX + Math.floor((layout.panelW - text.length) / 2), infoY - 1, text, hovered.color);
+    }
+
+    const hint = 'CLOSE: I';
+    r.drawRawText(layout.panelX + Math.floor((layout.panelW - hint.length) / 2), infoY, hint, INV_INFO);
+  }
+
   private drawUI(): void {
     const r = this.renderer;
 
-    r.fillRect(0, 0, 30, 6, '#000000');
+    r.fillRect(0, 0, 40, 6, '#000000');
 
     r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
     r.drawRawText(
@@ -496,6 +662,11 @@ export class Engine {
       r.drawRawText(1, 3, 'ENEMY DEFEATED', '#2a7a5a');
     }
 
-    r.drawRawText(1, 4, 'MOVE: WASD  ATTACK: left mouse button', '#2a7a5a');
+    r.drawRawText(
+      1,
+      4,
+      this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'MOVE: WASD  ATTACK: LMB  INVENTORY: I',
+      '#2a7a5a'
+    );
   }
 }
