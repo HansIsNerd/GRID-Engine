@@ -15,6 +15,16 @@ interface Rgb {
   b: number;
 }
 
+interface Particle {
+  pos: Vector3;
+  vel: Vector3;
+  life: number;
+  maxLife: number;
+  char: string;
+  color: string;
+  gravity: number;
+}
+
 const ASCII_RAMP = ' .:-=+*#%@';
 
 const NEAR = 0.5;
@@ -37,6 +47,15 @@ const PLAYER_MAX_HP = 100;
 const NPC_MAX_HP = 100;
 const TARGET_UI_RANGE = 8;
 
+const GRAVITY = 9.8;
+const SPARK_MIN = 5;
+const SPARK_MAX = 8;
+const SPARK_LIFE = 0.6;
+const INDICATOR_LIFE = 0.9;
+const PARTICLE_DEPTH_BIAS = 0.3;
+const MAX_PARTICLES = 512;
+const SPARK_COLORS: string[] = ['#ffffff', '#ffee55', '#ffd028'];
+
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
 const NPC_RGB: Rgb = { r: 255, g: 40, b: 160 };
 const FLASH_RGB: Rgb = { r: 255, g: 255, b: 255 };
@@ -52,6 +71,8 @@ export class Engine {
   private readonly npcPos: Vector3;
   private npcHealth: number;
   private npcHitTimer: number;
+
+  private readonly particles: Particle[];
 
   private readonly pitch: number;
   private readonly yaw: number;
@@ -83,6 +104,8 @@ export class Engine {
     this.npcPos = new Vector3(6, 0, -4);
     this.npcHealth = NPC_MAX_HP;
     this.npcHitTimer = 0;
+
+    this.particles = [];
 
     this.pitch = CAMERA_PITCH;
     this.yaw = 0;
@@ -177,6 +200,66 @@ export class Engine {
     return Math.sqrt(dx * dx + dz * dz);
   }
 
+  private spawnHitEffect(pos: Vector3): void {
+    const origin = new Vector3(pos.x, pos.y + CUBE_HALF * 2, pos.z);
+    const count = SPARK_MIN + Math.floor(Math.random() * (SPARK_MAX - SPARK_MIN + 1));
+
+    for (let i = 0; i < count; i++) {
+      if (this.particles.length >= MAX_PARTICLES) break;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 2 + Math.random() * 3;
+      const life = SPARK_LIFE * (0.6 + Math.random() * 0.4);
+      this.particles.push({
+        pos: origin.clone(),
+        vel: new Vector3(Math.cos(angle) * speed, 3 + Math.random() * 3, Math.sin(angle) * speed),
+        life,
+        maxLife: life,
+        char: '*',
+        color: SPARK_COLORS[Math.floor(Math.random() * SPARK_COLORS.length)] ?? '#ffffff',
+        gravity: GRAVITY,
+      });
+    }
+
+    if (this.particles.length < MAX_PARTICLES) {
+      this.particles.push({
+        pos: new Vector3(origin.x, origin.y + 0.5, origin.z),
+        vel: new Vector3(0, 1.8, 0),
+        life: INDICATOR_LIFE,
+        maxLife: INDICATOR_LIFE,
+        char: '-',
+        color: '#ff2020',
+        gravity: 0,
+      });
+    }
+  }
+
+  private updateParticles(dt: number): void {
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      if (!p) continue;
+
+      p.life -= dt;
+      if (p.life <= 0) {
+        const last = this.particles[this.particles.length - 1];
+        if (last) this.particles[i] = last;
+        this.particles.pop();
+        continue;
+      }
+
+      p.vel.y -= p.gravity * dt;
+      p.pos.x += p.vel.x * dt;
+      p.pos.y += p.vel.y * dt;
+      p.pos.z += p.vel.z * dt;
+
+      if (p.pos.y < 0 && p.gravity > 0) {
+        p.pos.y = 0;
+        p.vel.y = 0;
+        p.vel.x *= 0.5;
+        p.vel.z *= 0.5;
+      }
+    }
+  }
+
   private update(dt: number): void {
     let dx = 0;
     let dz = 0;
@@ -205,11 +288,14 @@ export class Engine {
       if (this.distanceToNpc() < ATTACK_RANGE) {
         this.npcHealth = Math.max(0, this.npcHealth - ATTACK_DAMAGE);
         this.npcHitTimer = HIT_FLASH_TIME;
+        this.spawnHitEffect(this.npcPos);
       }
     }
     this.input.actionJustPressed = false;
 
     if (this.npcHitTimer > 0) this.npcHitTimer = Math.max(0, this.npcHitTimer - dt);
+
+    this.updateParticles(dt);
 
     const desired = this.playerPos.add(this.cameraOffset);
     const k = 1 - Math.exp(-8 * dt);
@@ -232,9 +318,19 @@ export class Engine {
       this.drawCube(viewProj, this.npcPos, 0, npcColor);
     }
     this.drawCube(viewProj, this.playerPos, this.facing, PLAYER_RGB);
+    this.drawParticles(viewProj);
     this.drawUI();
 
     r.present();
+  }
+
+  private drawParticles(viewProj: Matrix4): void {
+    for (const p of this.particles) {
+      const clip = viewProj.transformPointWithW(p.pos);
+      if (clip.w <= NEAR) continue;
+      const s = this.toScreen(clip);
+      this.renderer.drawChar(s.x, s.y, p.char, p.color, s.z - PARTICLE_DEPTH_BIAS);
+    }
   }
 
   private toScreen(c: Vec4): ScreenVertex {
@@ -400,6 +496,6 @@ export class Engine {
       r.drawRawText(1, 3, 'ENEMY DEFEATED', '#2a7a5a');
     }
 
-    r.drawRawText(1, 4, 'MOVE: WASD  ATTACK: SPACE', '#2a7a5a');
+    r.drawRawText(1, 4, 'MOVE: WASD  ATTACK: left mouse button', '#2a7a5a');
   }
 }

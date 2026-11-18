@@ -1,64 +1,44 @@
+// src/engine/core/Input.ts
 export class Input {
   public forward: boolean = false;
   public backward: boolean = false;
   public left: boolean = false;
   public right: boolean = false;
-  public action: boolean = false;
+  
+  public action: boolean = false; 
   public actionJustPressed: boolean = false;
 
-  private readonly onKeyDown = (e: KeyboardEvent): void => {
-    if (this.setKey(e.code, true, e.repeat)) e.preventDefault();
-  };
-
-  private readonly onKeyUp = (e: KeyboardEvent): void => {
-    if (this.setKey(e.code, false, false)) e.preventDefault();
-  };
-
-  private readonly onBlur = (): void => {
-    this.forward = false;
-    this.backward = false;
-    this.left = false;
-    this.right = false;
-    this.action = false;
-    this.actionJustPressed = false;
-  };
-
   constructor() {
-    window.addEventListener('keydown', this.onKeyDown);
-    window.addEventListener('keyup', this.onKeyUp);
-    window.addEventListener('blur', this.onBlur);
+    // --- Keyboard Events (Movement) ---
+    window.addEventListener('keydown', (e) => this.handleKey(e.code, true));
+    window.addEventListener('keyup', (e) => this.handleKey(e.code, false));
+
+    // --- Mouse Events (Action / Attack) ---
+    window.addEventListener('mousedown', (e) => {
+      if (e.button === 0) { // 0 adalah Klik Kiri
+        if (!this.action) {
+          this.actionJustPressed = true; // Trigger sekali saat ditekan
+        }
+        this.action = true;
+      }
+    });
+
+    window.addEventListener('mouseup', (e) => {
+      if (e.button === 0) {
+        this.action = false;
+      }
+    });
   }
 
-  private setKey(code: string, down: boolean, repeat: boolean): boolean {
-    switch (code) {
-      case 'KeyW':
-      case 'ArrowUp':
-        this.forward = down;
-        return true;
-      case 'KeyS':
-      case 'ArrowDown':
-        this.backward = down;
-        return true;
-      case 'KeyA':
-      case 'ArrowLeft':
-        this.left = down;
-        return true;
-      case 'KeyD':
-      case 'ArrowRight':
-        this.right = down;
-        return true;
-      case 'Space':
-        if (down && !this.action && !repeat) this.actionJustPressed = true;
-        this.action = down;
-        return true;
-      default:
-        return false;
-    }
+  private handleKey(code: string, isDown: boolean) {
+    if (code === 'KeyW' || code === 'ArrowUp') this.forward = isDown;
+    if (code === 'KeyS' || code === 'ArrowDown') this.backward = isDown;
+    if (code === 'KeyA' || code === 'ArrowLeft') this.left = isDown;
+    if (code === 'KeyD' || code === 'ArrowRight') this.right = isDown;
   }
 
-  public dispose(): void {
-    window.removeEventListener('keydown', this.onKeyDown);
-    window.removeEventListener('keyup', this.onKeyUp);
-    window.removeEventListener('blur', this.onBlur);
+  // Panggil ini di akhir game loop (di Engine.ts)
+  public resetJustPressed() {
+    this.actionJustPressed = false;
   }
-}   
+}
