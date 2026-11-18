@@ -40,6 +40,12 @@ interface Loot {
   age: number;
 }
 
+interface ExpFragment {
+  pos: Vector3;
+  value: number;
+  age: number;
+}
+
 interface InventoryLayout {
   panelX: number;
   panelY: number;
@@ -67,7 +73,7 @@ const FOG_LEVELS = 24;
 
 const CUBE_HALF = 0.5;
 const ATTACK_RANGE = 2.5;
-const ATTACK_DAMAGE = 10;
+const BASE_ATTACK_DAMAGE = 10;
 const HIT_FLASH_TIME = 0.2;
 const PLAYER_MAX_HP = 100;
 const NPC_MAX_HP = 100;
@@ -98,6 +104,38 @@ const LOOT_GLOW_MIN_INTENSITY = 0.85;
 const MAX_LOOT = 64;
 const LOOT_RGB: Rgb = { r: 255, g: 220, b: 40 };
 
+const EXP_FRAGMENT_MIN = 3;
+const EXP_FRAGMENT_MAX = 5;
+const EXP_FRAGMENT_VALUE = 8;
+const EXP_FRAGMENT_SCALE = 0.22;
+const EXP_FRAGMENT_PICKUP_RANGE = 1.3;
+const EXP_FRAGMENT_SCATTER_MIN = 0.6;
+const EXP_FRAGMENT_SCATTER_MAX = 1.8;
+const EXP_FRAGMENT_BOB_HEIGHT = 0.6;
+const EXP_FRAGMENT_BOB_AMPLITUDE = 0.2;
+const EXP_FRAGMENT_BOB_SPEED = 4;
+const EXP_FRAGMENT_SPIN_SPEED = 3;
+const EXP_FRAGMENT_GLOW_MIN_INTENSITY = 0.9;
+const MAX_EXP_FRAGMENTS = 64;
+const EXP_RGB: Rgb = { r: 0, g: 255, b: 255 };
+const EXP_PICKUP_COLORS: string[] = ['#00ffff', '#66ffff', '#ccffff'];
+
+const START_LEVEL = 1;
+const START_EXP_TO_NEXT = 20;
+const EXP_GROWTH = 1.5;
+const CYBER_CORE_ATTACK_BONUS = 5;
+const CYBER_CORE_NAME = 'Cyber-Core';
+
+const PULSE_DURATION = 1.0;
+const PULSE_MAX_RADIUS = 12;
+const PULSE_DAMAGE_BASE = 20;
+const PULSE_DAMAGE_PER_LEVEL = 5;
+const PULSE_RING_MIN_POINTS = 32;
+const PULSE_RING_MAX_POINTS = 180;
+const PULSE_RING_HEIGHT = 0.25;
+const PULSE_TRAIL_LAG = 0.12;
+const PULSE_DEPTH_BIAS = 0.25;
+
 const GRAVITY = 9.8;
 const SPARK_MIN = 5;
 const SPARK_MAX = 8;
@@ -119,6 +157,13 @@ const LOOT_POOL: Item[] = [
   { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50' },
   { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6' },
 ];
+
+const CYBER_CORE_TEMPLATE: Item = {
+  name: CYBER_CORE_NAME,
+  char: 'C',
+  color: '#00ffff',
+  detail: 'Click: ATK +5',
+};
 
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
 const NPC_RGB: Rgb = { r: 255, g: 40, b: 160 };
@@ -152,6 +197,11 @@ export class Engine {
   private facing: number;
   private playerHealth: number;
 
+  private playerExp: number;
+  private playerLevel: number;
+  private expToNextLevel: number;
+  private attackDamage: number;
+
   private readonly npcPos: Vector3;
   private npcHealth: number;
   private npcMaxHp: number;
@@ -163,6 +213,12 @@ export class Engine {
 
   private readonly particles: Particle[];
   private readonly lootItems: Loot[];
+  private readonly expFragments: ExpFragment[];
+
+  private pulseTimer: number;
+  private readonly pulseOrigin: Vector3;
+  private pulseHitNpc: boolean;
+  private pulseDamage: number;
 
   private isInventoryOpen: boolean;
   private readonly inventoryItems: Array<InventoryItem | null>;
@@ -197,6 +253,11 @@ export class Engine {
     this.facing = 0;
     this.playerHealth = PLAYER_MAX_HP;
 
+    this.playerExp = 0;
+    this.playerLevel = START_LEVEL;
+    this.expToNextLevel = START_EXP_TO_NEXT;
+    this.attackDamage = BASE_ATTACK_DAMAGE;
+
     this.npcPos = new Vector3(NPC_START_X, 0, NPC_START_Z);
     this.npcHealth = NPC_MAX_HP;
     this.npcMaxHp = NPC_MAX_HP;
@@ -208,6 +269,12 @@ export class Engine {
 
     this.particles = [];
     this.lootItems = [];
+    this.expFragments = [];
+
+    this.pulseTimer = 0;
+    this.pulseOrigin = new Vector3(0, 0, 0);
+    this.pulseHitNpc = false;
+    this.pulseDamage = 0;
 
     this.isInventoryOpen = false;
     this.hoverSlot = -1;
@@ -352,7 +419,7 @@ export class Engine {
     }
   }
 
-  private spawnPickupEffect(pos: Vector3): void {
+  private spawnPickupEffect(pos: Vector3, colors: string[] = PICKUP_COLORS): void {
     const origin = new Vector3(pos.x, pos.y + LOOT_BOB_HEIGHT, pos.z);
     const count = PICKUP_MIN + Math.floor(Math.random() * (PICKUP_MAX - PICKUP_MIN + 1));
 
@@ -367,7 +434,7 @@ export class Engine {
         life,
         maxLife: life,
         char: '+',
-        color: PICKUP_COLORS[Math.floor(Math.random() * PICKUP_COLORS.length)] ?? '#00ff9c',
+        color: colors[Math.floor(Math.random() * colors.length)] ?? '#00ff9c',
         gravity: GRAVITY * 0.5,
       });
     }
@@ -411,11 +478,68 @@ export class Engine {
     });
   }
 
+  private spawnExpFragments(pos: Vector3): void {
+    const count = EXP_FRAGMENT_MIN + Math.floor(Math.random() * (EXP_FRAGMENT_MAX - EXP_FRAGMENT_MIN + 1));
+    for (let i = 0; i < count; i++) {
+      if (this.expFragments.length >= MAX_EXP_FRAGMENTS) break;
+      const angle = Math.random() * Math.PI * 2;
+      const dist = EXP_FRAGMENT_SCATTER_MIN + Math.random() * (EXP_FRAGMENT_SCATTER_MAX - EXP_FRAGMENT_SCATTER_MIN);
+      const x = Math.max(-GRID_HALF, Math.min(GRID_HALF, pos.x + Math.cos(angle) * dist));
+      const z = Math.max(-GRID_HALF, Math.min(GRID_HALF, pos.z + Math.sin(angle) * dist));
+      this.expFragments.push({
+        pos: new Vector3(x, 0, z),
+        value: EXP_FRAGMENT_VALUE,
+        age: Math.random() * Math.PI * 2,
+      });
+    }
+  }
+
+  private killNpc(): void {
+    this.spawnLoot(this.npcPos);
+    this.spawnExpFragments(this.npcPos);
+    this.npcRespawnTimer = NPC_RESPAWN_TIME;
+  }
+
   private firstEmptySlot(): number {
     for (let i = 0; i < this.inventoryItems.length; i++) {
       if (this.inventoryItems[i] === null) return i;
     }
     return -1;
+  }
+
+  private grantCyberCore(): void {
+    const slot = this.firstEmptySlot();
+    if (slot >= 0) {
+      this.inventoryItems[slot] = { ...CYBER_CORE_TEMPLATE };
+      return;
+    }
+    if (this.lootItems.length >= MAX_LOOT) return;
+    this.lootItems.push({
+      pos: new Vector3(this.playerPos.x, 0, this.playerPos.z),
+      item: { ...CYBER_CORE_TEMPLATE },
+      age: 0,
+    });
+  }
+
+  private triggerResonancePulse(): void {
+    this.pulseTimer = PULSE_DURATION;
+    this.pulseOrigin.x = this.playerPos.x;
+    this.pulseOrigin.y = 0;
+    this.pulseOrigin.z = this.playerPos.z;
+    this.pulseHitNpc = false;
+    this.pulseDamage = PULSE_DAMAGE_BASE + PULSE_DAMAGE_PER_LEVEL * this.playerLevel;
+  }
+
+  private checkLevelUp(): void {
+    let leveled = false;
+    while (this.playerExp >= this.expToNextLevel) {
+      this.playerExp -= this.expToNextLevel;
+      this.playerLevel += 1;
+      this.expToNextLevel = Math.floor(this.expToNextLevel * EXP_GROWTH);
+      this.grantCyberCore();
+      leveled = true;
+    }
+    if (leveled) this.triggerResonancePulse();
   }
 
   private updateLoot(dt: number): void {
@@ -436,6 +560,59 @@ export class Engine {
       this.spawnPickupEffect(loot.pos);
       this.lootItems.splice(i, 1);
     }
+  }
+
+  private updateExpFragments(dt: number): void {
+    for (let i = this.expFragments.length - 1; i >= 0; i--) {
+      const frag = this.expFragments[i];
+      if (!frag) continue;
+
+      frag.age += dt;
+
+      const dx = frag.pos.x - this.playerPos.x;
+      const dz = frag.pos.z - this.playerPos.z;
+      if (Math.sqrt(dx * dx + dz * dz) >= EXP_FRAGMENT_PICKUP_RANGE) continue;
+
+      this.playerExp += frag.value;
+      this.spawnPickupEffect(frag.pos, EXP_PICKUP_COLORS);
+      const last = this.expFragments[this.expFragments.length - 1];
+      if (last) this.expFragments[i] = last;
+      this.expFragments.pop();
+    }
+    this.checkLevelUp();
+  }
+
+  private pulseRadius(): number {
+    // t runs 0 -> 1 as pulseTimer counts down from PULSE_DURATION to 0.
+    const t = 1 - this.pulseTimer / PULSE_DURATION;
+    // Ease-out quadratic: eased = 1 - (1 - t)^2. The ring bursts outward fast
+    // (derivative 2 at t=0) and decelerates to zero speed at t=1, which reads
+    // as a shockwave losing energy.
+    const eased = 1 - (1 - t) * (1 - t);
+    // World-space radius in grid units, measured from pulseOrigin on the XZ plane.
+    return PULSE_MAX_RADIUS * eased;
+  }
+
+  private updatePulse(dt: number): void {
+    if (this.pulseTimer <= 0) return;
+    this.pulseTimer = Math.max(0, this.pulseTimer - dt);
+
+    if (this.pulseHitNpc || !this.npcAlive()) return;
+
+    // Damage rule: an enemy is hit the first frame the expanding ring's radius
+    // reaches its distance from the pulse origin. dist = sqrt(dx^2 + dz^2),
+    // compared against the current radius. The flag guarantees one hit per
+    // pulse, so the wave "sweeps through" the enemy exactly once.
+    const dx = this.npcPos.x - this.pulseOrigin.x;
+    const dz = this.npcPos.z - this.pulseOrigin.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    if (dist > this.pulseRadius()) return;
+
+    this.pulseHitNpc = true;
+    this.npcHealth = Math.max(0, this.npcHealth - this.pulseDamage);
+    this.npcHitTimer = HIT_FLASH_TIME;
+    this.spawnHitEffect(this.npcPos, EXP_PICKUP_COLORS);
+    if (this.npcHealth <= 0) this.killNpc();
   }
 
   private randomNpcSpawn(): Vector3 {
@@ -534,6 +711,9 @@ export class Engine {
     this.npcRespawnTimer = 0;
 
     this.lootItems.length = 0;
+    this.expFragments.length = 0;
+    this.pulseTimer = 0;
+    this.pulseHitNpc = true;
   }
 
   private getInventoryLayout(): InventoryLayout {
@@ -574,6 +754,34 @@ export class Engine {
     return sr * INV_COLS + sc;
   }
 
+  private handleInventoryClick(): void {
+    // Click flow, executed only while the inventory is open:
+    // 1. hoverSlot was just recomputed from the mouse position (screen px ->
+    //    cell col/row -> slot index via slotAtMouse). -1 means the cursor is
+    //    over padding, a gap between slots, or outside the grid.
+    // 2. actionJustPressed is the one-frame edge flag set by Input on the
+    //    left-button mousedown. Using the edge (not the held state) ensures
+    //    one click consumes at most ONE item, even if the button is held.
+    // 3. We read the item in that slot and only act if it is a Cyber-Core.
+    //    Any other item is ignored here (no accidental consumption).
+    if (!this.input.actionJustPressed) return;
+    if (this.hoverSlot < 0) return;
+
+    const item = this.inventoryItems[this.hoverSlot];
+    if (!item || item.name !== CYBER_CORE_NAME) return;
+
+    // 4. Consume: the permanent stat gain is applied, then the slot is set to
+    //    null so the core cannot be reused and the slot becomes free for loot.
+    this.attackDamage += CYBER_CORE_ATTACK_BONUS;
+    this.inventoryItems[this.hoverSlot] = null;
+
+    // 5. Close the inventory and reset hover so no stale highlight remains
+    //    when it reopens. The caller clears actionJustPressed afterwards, so
+    //    this same click cannot leak into the combat code as an attack.
+    this.isInventoryOpen = false;
+    this.hoverSlot = -1;
+  }
+
   private update(dt: number): void {
     if (this.input.inventoryJustPressed) {
       this.isInventoryOpen = !this.isInventoryOpen;
@@ -583,6 +791,7 @@ export class Engine {
 
     if (this.isInventoryOpen) {
       this.hoverSlot = this.slotAtMouse();
+      this.handleInventoryClick();
       this.input.actionJustPressed = false;
       return;
     }
@@ -612,13 +821,10 @@ export class Engine {
 
     if (this.input.actionJustPressed && this.npcAlive()) {
       if (this.distanceToNpc() < ATTACK_RANGE) {
-        this.npcHealth = Math.max(0, this.npcHealth - ATTACK_DAMAGE);
+        this.npcHealth = Math.max(0, this.npcHealth - this.attackDamage);
         this.npcHitTimer = HIT_FLASH_TIME;
         this.spawnHitEffect(this.npcPos, SPARK_COLORS);
-        if (this.npcHealth <= 0) {
-          this.spawnLoot(this.npcPos);
-          this.npcRespawnTimer = NPC_RESPAWN_TIME;
-        }
+        if (this.npcHealth <= 0) this.killNpc();
       }
     }
     this.input.actionJustPressed = false;
@@ -631,6 +837,8 @@ export class Engine {
     if (this.playerHealth <= 0) this.respawn();
 
     this.updateLoot(dt);
+    this.updateExpFragments(dt);
+    this.updatePulse(dt);
     this.updateParticles(dt);
 
     const desired = this.playerPos.add(this.cameraOffset);
@@ -652,6 +860,7 @@ export class Engine {
 
     this.drawFloor(viewProj);
     this.drawLoot(viewProj, dim);
+    this.drawExpFragments(viewProj, dim);
     if (this.npcAlive()) {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
       this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
@@ -661,11 +870,64 @@ export class Engine {
       g: PLAYER_RGB.g * dim,
       b: PLAYER_RGB.b * dim,
     });
+    this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     this.drawUI();
     if (this.isInventoryOpen) this.drawInventory();
 
     r.present();
+  }
+
+  private drawPulseRing(viewProj: Matrix4, radius: number, fade: number, char: string): void {
+    if (radius <= 0.05) return;
+
+    // Ring sampling: the circle's circumference is 2*pi*radius. Point count
+    // scales linearly with radius (about 8 points per unit of radius) and is
+    // clamped, so the ring keeps a constant on-screen density while growing
+    // and cost stays bounded.
+    const count = Math.max(
+      PULSE_RING_MIN_POINTS,
+      Math.min(PULSE_RING_MAX_POINTS, Math.floor(radius * 8))
+    );
+    const step = (Math.PI * 2) / count;
+
+    // Brightness fades linearly with remaining pulse time; the blue/green
+    // channels keep the cyan hue, the red channel stays 0.
+    const g = Math.floor(255 * fade);
+    const color = this.isInventoryOpen ? '#0a3a2a' : `rgb(0,${g},${g})`;
+
+    for (let i = 0; i < count; i++) {
+      // Parametric circle on the XZ ground plane:
+      // x = ox + R*cos(a), z = oz + R*sin(a), y fixed just above the floor.
+      const a = i * step;
+      const wp = new Vector3(
+        this.pulseOrigin.x + Math.cos(a) * radius,
+        PULSE_RING_HEIGHT,
+        this.pulseOrigin.z + Math.sin(a) * radius
+      );
+      const clip = viewProj.transformPointWithW(wp);
+      if (clip.w <= NEAR) continue;
+      const s = this.toScreen(clip);
+      this.renderer.drawChar(s.x, s.y, char, color, s.z - PULSE_DEPTH_BIAS);
+    }
+  }
+
+  private drawPulse(viewProj: Matrix4): void {
+    if (this.pulseTimer <= 0) return;
+
+    const fade = this.pulseTimer / PULSE_DURATION;
+    const radius = this.pulseRadius();
+
+    // Leading edge: bright '@' ring at the current radius R(t).
+    // Trailing echo: a dimmer 'o' ring at R(t - lag) sampled from the same
+    // easing curve, giving the wave visible thickness. Math.max(0, ...) keeps
+    // the trail from going negative at the start of the animation.
+    const t = 1 - this.pulseTimer / PULSE_DURATION;
+    const tTrail = Math.max(0, t - PULSE_TRAIL_LAG);
+    const trailRadius = PULSE_MAX_RADIUS * (1 - (1 - tTrail) * (1 - tTrail));
+
+    this.drawPulseRing(viewProj, radius, fade, '@');
+    this.drawPulseRing(viewProj, trailRadius, fade * 0.6, 'o');
   }
 
   private drawLoot(viewProj: Matrix4, dim: number): void {
@@ -680,6 +942,22 @@ export class Engine {
         { r: LOOT_RGB.r * pulse * dim, g: LOOT_RGB.g * pulse * dim, b: LOOT_RGB.b * pulse * dim },
         LOOT_SCALE,
         LOOT_GLOW_MIN_INTENSITY
+      );
+    }
+  }
+
+  private drawExpFragments(viewProj: Matrix4, dim: number): void {
+    for (const frag of this.expFragments) {
+      const pulse = 0.8 + 0.2 * Math.sin(frag.age * 7);
+      const bob = EXP_FRAGMENT_BOB_HEIGHT + Math.sin(frag.age * EXP_FRAGMENT_BOB_SPEED) * EXP_FRAGMENT_BOB_AMPLITUDE;
+      const pos = new Vector3(frag.pos.x, frag.pos.y + bob, frag.pos.z);
+      this.drawCube(
+        viewProj,
+        pos,
+        frag.age * EXP_FRAGMENT_SPIN_SPEED,
+        { r: EXP_RGB.r * pulse * dim, g: EXP_RGB.g * pulse * dim, b: EXP_RGB.b * pulse * dim },
+        EXP_FRAGMENT_SCALE,
+        EXP_FRAGMENT_GLOW_MIN_INTENSITY
       );
     }
   }
@@ -935,6 +1213,13 @@ export class Engine {
       4,
       this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'MOVE: WASD  ATTACK: LMB  INVENTORY: I',
       '#2a7a5a'
+    );
+
+    r.drawRawText(
+      1,
+      5,
+      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.attackDamage}`,
+      '#00ffff'
     );
   }
 }
