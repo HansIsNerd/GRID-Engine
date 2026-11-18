@@ -1,5 +1,6 @@
 import { Vector3 } from '../math/Vector3';
 import { Matrix4, type Vec4 } from '../math/Matrix4';
+import { fbm2, hash2 } from '../math/Noise';
 import { AsciiRenderer } from '../renderer/AsciiRenderer';
 import { Input } from './Input';
 
@@ -55,6 +56,17 @@ interface InventoryLayout {
   gridY: number;
 }
 
+interface Obstacle {
+  x: number;
+  z: number;
+  half: number;
+  height: number;
+  solid: boolean;
+  flicker: boolean;
+  rgb: Rgb;
+  minIntensity: number;
+}
+
 type NpcState = 'idle' | 'chase';
 
 const ASCII_RAMP = ' .:-=+*#%@';
@@ -64,12 +76,45 @@ const FAR = 100;
 const FOV = Math.PI / 3;
 
 const GRID_HALF = 40;
+const GRID_SIZE = GRID_HALF * 2 + 1;
 const MOVE_SPEED = 6;
 
 const CAMERA_PITCH = -Math.PI / 3;
 const CAMERA_HEIGHT = 10;
 
 const FOG_LEVELS = 24;
+
+const BIOME_WASTES = 0;
+const BIOME_CITY = 1;
+const BIOME_ACID = 2;
+const BIOME_GLITCH = 3;
+const BIOME_NAMES: string[] = ['DATA WASTES', 'NEON CITY', 'ACID POOL', 'GLITCH ZONE'];
+const BIOME_UI_COLORS: string[] = ['#00ff9c', '#00ffff', '#d0ff00', '#ff2040'];
+
+const WORLD_SEED = 1337;
+const SAFE_RADIUS = 9;
+const ACID_DAMAGE = 5;
+const ACID_TICK = 1;
+const MINOR_SCALE = 70 / 150;
+const GLITCH_FLICKER_RATE = 12;
+
+const WASTES_RGB: Rgb = { r: 0, g: 150, b: 105 };
+const FLOOR_RGB: Rgb[] = [
+  WASTES_RGB,
+  { r: 0, g: 220, b: 255 },
+  { r: 190, g: 255, b: 0 },
+  { r: 255, g: 30, b: 50 },
+];
+const GLITCH_FLASH_RGB: Rgb = { r: 255, g: 90, b: 220 };
+
+const TOWER_RGB: Rgb = { r: 255, g: 40, b: 200 };
+const DATA_BLOCK_RGB: Rgb = { r: 0, g: 230, b: 255 };
+const DEBRIS_RGB: Rgb = { r: 0, g: 170, b: 100 };
+const WASTE_BLOCK_RGB: Rgb = { r: 0, g: 255, b: 130 };
+const GLITCH_BLOCK_RGB: Rgb = { r: 255, g: 30, b: 50 };
+const ACID_DEBRIS_RGB: Rgb = { r: 170, g: 255, b: 0 };
+const ACID_COLORS: string[] = ['#d0ff00', '#a0ff00', '#ffff55'];
+const OBSTACLE_CULL_MARGIN = 8;
 
 const CUBE_HALF = 0.5;
 const ATTACK_RANGE = 2.5;
@@ -231,10 +276,14 @@ export class Engine {
 
   private readonly fogStart: number;
   private readonly fogEnd: number;
-  private readonly majorPalette: string[];
-  private readonly minorPalette: string[];
-  private readonly dimMajorPalette: string[];
-  private readonly dimMinorPalette: string[];
+  private readonly floorPalettes: string[][];
+  private readonly flashPalettes: string[];
+
+  private readonly biomeGrid: Uint8Array;
+  private readonly obstacles: Obstacle[];
+  private readonly obstacleGrid: Int16Array;
+  private time: number;
+  private acidTimer: number;
 
   private readonly cubeVertices: Vector3[];
   private readonly cubeFaces: number[][];
@@ -301,10 +350,32 @@ export class Engine {
         : FAR;
     this.fogStart = playerDepth;
     this.fogEnd = Math.max(playerDepth + 1, topDepth * 0.95);
-    this.majorPalette = Engine.buildPalette(150);
-    this.minorPalette = Engine.buildPalette(70);
-    this.dimMajorPalette = Engine.buildPalette(150 * DIM_FACTOR);
-    this.dimMinorPalette = Engine.buildPalette(70 * DIM_FACTOR);
+
+    this.floorPalettes = [];
+    for (let b = 0; b < FLOOR_RGB.length; b++) {
+      const c = FLOOR_RGB[b] ?? WASTES_RGB;
+      this.floorPalettes.push(Engine.buildPalette(c, MINOR_SCALE));
+      this.floorPalettes.push(Engine.buildPalette(c, MINOR_SCALE * DIM_FACTOR));
+      this.floorPalettes.push(Engine.buildPalette(c, 1));
+      this.floorPalettes.push(Engine.buildPalette(c, DIM_FACTOR));
+    }
+    this.flashPalettes = [];
+    this.flashPalettes.push(Engine.buildFlash(MINOR_SCALE));
+    this.flashPalettes.push(Engine.buildFlash(MINOR_SCALE * DIM_FACTOR));
+    this.flashPalettes.push(Engine.buildFlash(1));
+    this.flashPalettes.push(Engine.buildFlash(DIM_FACTOR));
+
+    this.time = 0;
+    this.acidTimer = 0;
+    this.biomeGrid = new Uint8Array(GRID_SIZE * GRID_SIZE);
+    for (let iz = 0; iz < GRID_SIZE; iz++) {
+      for (let ix = 0; ix < GRID_SIZE; ix++) {
+        this.biomeGrid[iz * GRID_SIZE + ix] = Engine.computeBiome(ix - GRID_HALF, iz - GRID_HALF);
+      }
+    }
+    this.obstacles = [];
+    this.obstacleGrid = new Int16Array(GRID_SIZE * GRID_SIZE).fill(-1);
+    this.buildObstacles();
 
     const h = CUBE_HALF;
     this.cubeVertices = [
@@ -333,13 +404,148 @@ export class Engine {
     this.running = false;
   }
 
-  private static buildPalette(base: number): string[] {
+  private static buildPalette(rgb: Rgb, scale: number): string[] {
     const out: string[] = [];
     for (let i = 0; i < FOG_LEVELS; i++) {
-      const f = (i + 1) / FOG_LEVELS;
-      out.push(`rgb(0,${Math.floor(base * f)},${Math.floor(base * 0.7 * f)})`);
+      const f = ((i + 1) / FOG_LEVELS) * scale;
+      out.push(`rgb(${Math.floor(rgb.r * f)},${Math.floor(rgb.g * f)},${Math.floor(rgb.b * f)})`);
     }
     return out;
+  }
+
+  private static buildFlash(scale: number): string {
+    const c = GLITCH_FLASH_RGB;
+    return `rgb(${Math.floor(c.r * scale)},${Math.floor(c.g * scale)},${Math.floor(c.b * scale)})`;
+  }
+
+  private static computeBiome(x: number, z: number): number {
+    if (Math.sqrt(x * x + z * z) < SAFE_RADIUS) return BIOME_WASTES;
+    const v = fbm2(x * 0.055, z * 0.055, WORLD_SEED, 3);
+    const w = fbm2(x * 0.07 + 41.3, z * 0.07 - 17.9, WORLD_SEED + 1, 3);
+    if (v > 0.6) return BIOME_CITY;
+    if (w > 0.62) return BIOME_ACID;
+    if (w < 0.38) return BIOME_GLITCH;
+    return BIOME_WASTES;
+  }
+
+  private biomeAtPos(x: number, z: number): number {
+    const ix = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(x) + GRID_HALF));
+    const iz = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(z) + GRID_HALF));
+    return this.biomeGrid[iz * GRID_SIZE + ix] ?? BIOME_WASTES;
+  }
+
+  private addObstacle(o: Obstacle): void {
+    const ix = o.x + GRID_HALF;
+    const iz = o.z + GRID_HALF;
+    this.obstacleGrid[iz * GRID_SIZE + ix] = this.obstacles.length;
+    this.obstacles.push(o);
+  }
+
+  private buildObstacles(): void {
+    for (let z = -GRID_HALF + 1; z < GRID_HALF; z++) {
+      for (let x = -GRID_HALF + 1; x < GRID_HALF; x++) {
+        if (Math.sqrt(x * x + z * z) < SAFE_RADIUS) continue;
+        const biome = this.biomeGrid[(z + GRID_HALF) * GRID_SIZE + x + GRID_HALF] ?? BIOME_WASTES;
+        const r = hash2(x, z, WORLD_SEED + 7);
+        const r2 = hash2(x, z, WORLD_SEED + 13);
+        const r3 = hash2(x, z, WORLD_SEED + 29);
+
+        if (biome === BIOME_CITY) {
+          if ((x & 1) !== 0 || (z & 1) !== 0) continue;
+          if (r >= 0.42) continue;
+          if (r2 < 0.75) {
+            this.addObstacle({
+              x,
+              z,
+              half: 0.4 + 0.2 * r3,
+              height: 3 + 4 * r3,
+              solid: true,
+              flicker: false,
+              rgb: TOWER_RGB,
+              minIntensity: 0.35,
+            });
+          } else {
+            this.addObstacle({
+              x,
+              z,
+              half: 0.5,
+              height: 1.2,
+              solid: true,
+              flicker: false,
+              rgb: DATA_BLOCK_RGB,
+              minIntensity: 0.4,
+            });
+          }
+        } else if (biome === BIOME_WASTES) {
+          if (r < 0.04) {
+            this.addObstacle({
+              x,
+              z,
+              half: 0.25,
+              height: 0.3 + 0.5 * r2,
+              solid: false,
+              flicker: false,
+              rgb: DEBRIS_RGB,
+              minIntensity: 0.3,
+            });
+          } else if (r < 0.055) {
+            this.addObstacle({
+              x,
+              z,
+              half: 0.5,
+              height: 1,
+              solid: true,
+              flicker: false,
+              rgb: WASTE_BLOCK_RGB,
+              minIntensity: 0.3,
+            });
+          }
+        } else if (biome === BIOME_GLITCH) {
+          if (r < 0.06) {
+            this.addObstacle({
+              x,
+              z,
+              half: 0.5,
+              height: 1 + 2 * r2,
+              solid: true,
+              flicker: true,
+              rgb: GLITCH_BLOCK_RGB,
+              minIntensity: 0.4,
+            });
+          }
+        } else if (r < 0.02) {
+          this.addObstacle({
+            x,
+            z,
+            half: 0.25,
+            height: 0.3,
+            solid: false,
+            flicker: false,
+            rgb: ACID_DEBRIS_RGB,
+            minIntensity: 0.4,
+          });
+        }
+      }
+    }
+  }
+
+  private blockedByObstacle(x: number, z: number): boolean {
+    const cx = Math.round(x) + GRID_HALF;
+    const cz = Math.round(z) + GRID_HALF;
+    for (let dz = -1; dz <= 1; dz++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const ix = cx + dx;
+        const iz = cz + dz;
+        if (ix < 0 || iz < 0 || ix >= GRID_SIZE || iz >= GRID_SIZE) continue;
+        const idx = this.obstacleGrid[iz * GRID_SIZE + ix] ?? -1;
+        if (idx < 0) continue;
+        const o = this.obstacles[idx];
+        if (!o || !o.solid) continue;
+        const lim = o.half + CUBE_HALF;
+        if (Math.abs(x - o.x) < lim && Math.abs(z - o.z) < lim) return true;
+      }
+    }
+    return false;
   }
 
   public start(): void {
@@ -583,13 +789,8 @@ export class Engine {
   }
 
   private pulseRadius(): number {
-    // t runs 0 -> 1 as pulseTimer counts down from PULSE_DURATION to 0.
     const t = 1 - this.pulseTimer / PULSE_DURATION;
-    // Ease-out quadratic: eased = 1 - (1 - t)^2. The ring bursts outward fast
-    // (derivative 2 at t=0) and decelerates to zero speed at t=1, which reads
-    // as a shockwave losing energy.
     const eased = 1 - (1 - t) * (1 - t);
-    // World-space radius in grid units, measured from pulseOrigin on the XZ plane.
     return PULSE_MAX_RADIUS * eased;
   }
 
@@ -599,10 +800,6 @@ export class Engine {
 
     if (this.pulseHitNpc || !this.npcAlive()) return;
 
-    // Damage rule: an enemy is hit the first frame the expanding ring's radius
-    // reaches its distance from the pulse origin. dist = sqrt(dx^2 + dz^2),
-    // compared against the current radius. The flag guarantees one hit per
-    // pulse, so the wave "sweeps through" the enemy exactly once.
     const dx = this.npcPos.x - this.pulseOrigin.x;
     const dz = this.npcPos.z - this.pulseOrigin.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -623,6 +820,7 @@ export class Engine {
     for (let i = 0; i < NPC_RESPAWN_TRIES; i++) {
       const x = (Math.random() * 2 - 1) * range;
       const z = (Math.random() * 2 - 1) * range;
+      if (this.blockedByObstacle(x, z) || this.biomeAtPos(x, z) === BIOME_ACID) continue;
       const dx = x - this.playerPos.x;
       const dz = z - this.playerPos.z;
       const d = Math.sqrt(dx * dx + dz * dz);
@@ -668,10 +866,14 @@ export class Engine {
 
     if (dist > NPC_STOP_DISTANCE) {
       const nextX = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.npcPos.x + dir.x * NPC_SPEED * dt));
-      if (!this.npcCollidesWithPlayer(nextX, this.npcPos.z)) this.npcPos.x = nextX;
+      if (!this.npcCollidesWithPlayer(nextX, this.npcPos.z) && !this.blockedByObstacle(nextX, this.npcPos.z)) {
+        this.npcPos.x = nextX;
+      }
 
       const nextZ = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.npcPos.z + dir.z * NPC_SPEED * dt));
-      if (!this.npcCollidesWithPlayer(this.npcPos.x, nextZ)) this.npcPos.z = nextZ;
+      if (!this.npcCollidesWithPlayer(this.npcPos.x, nextZ) && !this.blockedByObstacle(this.npcPos.x, nextZ)) {
+        this.npcPos.z = nextZ;
+      }
     } else {
       const push = (NPC_STOP_DISTANCE - dist) * 0.5;
       this.npcPos.x -= dir.x * push;
@@ -691,12 +893,26 @@ export class Engine {
     }
   }
 
+  private updateHazards(dt: number): void {
+    if (this.biomeAtPos(this.playerPos.x, this.playerPos.z) !== BIOME_ACID) {
+      this.acidTimer = 0;
+      return;
+    }
+    this.acidTimer += dt;
+    while (this.acidTimer >= ACID_TICK) {
+      this.acidTimer -= ACID_TICK;
+      this.playerHealth = Math.max(0, this.playerHealth - ACID_DAMAGE);
+      this.spawnHitEffect(this.playerPos, ACID_COLORS);
+    }
+  }
+
   private respawn(): void {
     this.playerHealth = PLAYER_MAX_HP;
     this.playerPos.x = 0;
     this.playerPos.y = 0;
     this.playerPos.z = 0;
     this.facing = 0;
+    this.acidTimer = 0;
     this.cameraPos = this.playerPos.add(this.cameraOffset);
 
     this.npcMaxHp = NPC_MAX_HP;
@@ -755,34 +971,22 @@ export class Engine {
   }
 
   private handleInventoryClick(): void {
-    // Click flow, executed only while the inventory is open:
-    // 1. hoverSlot was just recomputed from the mouse position (screen px ->
-    //    cell col/row -> slot index via slotAtMouse). -1 means the cursor is
-    //    over padding, a gap between slots, or outside the grid.
-    // 2. actionJustPressed is the one-frame edge flag set by Input on the
-    //    left-button mousedown. Using the edge (not the held state) ensures
-    //    one click consumes at most ONE item, even if the button is held.
-    // 3. We read the item in that slot and only act if it is a Cyber-Core.
-    //    Any other item is ignored here (no accidental consumption).
     if (!this.input.actionJustPressed) return;
     if (this.hoverSlot < 0) return;
 
     const item = this.inventoryItems[this.hoverSlot];
     if (!item || item.name !== CYBER_CORE_NAME) return;
 
-    // 4. Consume: the permanent stat gain is applied, then the slot is set to
-    //    null so the core cannot be reused and the slot becomes free for loot.
     this.attackDamage += CYBER_CORE_ATTACK_BONUS;
     this.inventoryItems[this.hoverSlot] = null;
 
-    // 5. Close the inventory and reset hover so no stale highlight remains
-    //    when it reopens. The caller clears actionJustPressed afterwards, so
-    //    this same click cannot leak into the combat code as an attack.
     this.isInventoryOpen = false;
     this.hoverSlot = -1;
   }
 
   private update(dt: number): void {
+    this.time += dt;
+
     if (this.input.inventoryJustPressed) {
       this.isInventoryOpen = !this.isInventoryOpen;
       this.hoverSlot = -1;
@@ -807,10 +1011,14 @@ export class Engine {
       const dir = new Vector3(dx, 0, dz).normalize();
 
       const nextX = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.x + dir.x * MOVE_SPEED * dt));
-      if (!this.collidesWithNpc(nextX, this.playerPos.z)) this.playerPos.x = nextX;
+      if (!this.collidesWithNpc(nextX, this.playerPos.z) && !this.blockedByObstacle(nextX, this.playerPos.z)) {
+        this.playerPos.x = nextX;
+      }
 
       const nextZ = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.z + dir.z * MOVE_SPEED * dt));
-      if (!this.collidesWithNpc(this.playerPos.x, nextZ)) this.playerPos.z = nextZ;
+      if (!this.collidesWithNpc(this.playerPos.x, nextZ) && !this.blockedByObstacle(this.playerPos.x, nextZ)) {
+        this.playerPos.z = nextZ;
+      }
 
       const target = Math.atan2(dir.x, dir.z);
       let diff = target - this.facing;
@@ -833,6 +1041,7 @@ export class Engine {
 
     this.updateNpc(dt);
     this.updateNpcRespawn(dt);
+    this.updateHazards(dt);
 
     if (this.playerHealth <= 0) this.respawn();
 
@@ -859,6 +1068,7 @@ export class Engine {
     const dim = this.isInventoryOpen ? DIM_FACTOR : 1;
 
     this.drawFloor(viewProj);
+    this.drawObstacles(viewProj, dim);
     this.drawLoot(viewProj, dim);
     this.drawExpFragments(viewProj, dim);
     if (this.npcAlive()) {
@@ -881,24 +1091,16 @@ export class Engine {
   private drawPulseRing(viewProj: Matrix4, radius: number, fade: number, char: string): void {
     if (radius <= 0.05) return;
 
-    // Ring sampling: the circle's circumference is 2*pi*radius. Point count
-    // scales linearly with radius (about 8 points per unit of radius) and is
-    // clamped, so the ring keeps a constant on-screen density while growing
-    // and cost stays bounded.
     const count = Math.max(
       PULSE_RING_MIN_POINTS,
       Math.min(PULSE_RING_MAX_POINTS, Math.floor(radius * 8))
     );
     const step = (Math.PI * 2) / count;
 
-    // Brightness fades linearly with remaining pulse time; the blue/green
-    // channels keep the cyan hue, the red channel stays 0.
     const g = Math.floor(255 * fade);
     const color = this.isInventoryOpen ? '#0a3a2a' : `rgb(0,${g},${g})`;
 
     for (let i = 0; i < count; i++) {
-      // Parametric circle on the XZ ground plane:
-      // x = ox + R*cos(a), z = oz + R*sin(a), y fixed just above the floor.
       const a = i * step;
       const wp = new Vector3(
         this.pulseOrigin.x + Math.cos(a) * radius,
@@ -918,10 +1120,6 @@ export class Engine {
     const fade = this.pulseTimer / PULSE_DURATION;
     const radius = this.pulseRadius();
 
-    // Leading edge: bright '@' ring at the current radius R(t).
-    // Trailing echo: a dimmer 'o' ring at R(t - lag) sampled from the same
-    // easing curve, giving the wave visible thickness. Math.max(0, ...) keeps
-    // the trail from going negative at the start of the animation.
     const t = 1 - this.pulseTimer / PULSE_DURATION;
     const tTrail = Math.max(0, t - PULSE_TRAIL_LAG);
     const trailRadius = PULSE_MAX_RADIUS * (1 - (1 - tTrail) * (1 - tTrail));
@@ -962,6 +1160,25 @@ export class Engine {
     }
   }
 
+  private drawObstacles(viewProj: Matrix4, dim: number): void {
+    const tick = Math.floor(this.time * GLITCH_FLICKER_RATE);
+    for (const o of this.obstacles) {
+      if (o.flicker && hash2(o.x * 1.7, o.z * 2.3, tick) < 0.18) continue;
+      const clip = viewProj.transformPointWithW(new Vector3(o.x, o.height * 0.5, o.z));
+      if (clip.w > this.fogEnd + OBSTACLE_CULL_MARGIN) continue;
+      this.drawBox(
+        viewProj,
+        new Vector3(o.x, 0, o.z),
+        0,
+        { r: o.rgb.r * dim, g: o.rgb.g * dim, b: o.rgb.b * dim },
+        o.half * 2,
+        o.height,
+        o.half * 2,
+        o.minIntensity
+      );
+    }
+  }
+
   private drawParticles(viewProj: Matrix4): void {
     const dimmed = this.isInventoryOpen;
     for (const p of this.particles) {
@@ -982,14 +1199,62 @@ export class Engine {
   }
 
   private drawFloor(viewProj: Matrix4): void {
+    const tick = Math.floor(this.time * GLITCH_FLICKER_RATE);
     for (let i = -GRID_HALF; i <= GRID_HALF; i++) {
       const major = i % 5 === 0;
-      this.drawWorldLine(new Vector3(-GRID_HALF, 0, i), new Vector3(GRID_HALF, 0, i), viewProj, major);
-      this.drawWorldLine(new Vector3(i, 0, -GRID_HALF), new Vector3(i, 0, GRID_HALF), viewProj, major);
+      this.drawFloorLine(viewProj, true, i, major, tick);
+      this.drawFloorLine(viewProj, false, i, major, tick);
     }
   }
 
-  private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, major: boolean): void {
+  private drawFloorLine(viewProj: Matrix4, horizontal: boolean, fixed: number, major: boolean, tick: number): void {
+    const base = horizontal ? (fixed + GRID_HALF) * GRID_SIZE : fixed + GRID_HALF;
+    const stride = horizontal ? 1 : GRID_SIZE;
+    let start = -GRID_HALF;
+    let cur = this.biomeGrid[base] ?? BIOME_WASTES;
+
+    for (let t = -GRID_HALF + 1; t <= GRID_HALF; t++) {
+      const b = t < GRID_HALF ? (this.biomeGrid[base + (t + GRID_HALF) * stride] ?? BIOME_WASTES) : -1;
+      if (b === cur && cur !== BIOME_GLITCH) continue;
+      this.emitFloorSegment(viewProj, horizontal, fixed, start, t, cur, major, tick);
+      start = t;
+      cur = b;
+    }
+  }
+
+  private emitFloorSegment(
+    viewProj: Matrix4,
+    horizontal: boolean,
+    fixed: number,
+    start: number,
+    end: number,
+    biome: number,
+    major: boolean,
+    tick: number
+  ): void {
+    const mi = (major ? 2 : 0) + (this.isInventoryOpen ? 1 : 0);
+    let palette = this.floorPalettes[biome * 4 + mi];
+    if (!palette) return;
+
+    if (biome === BIOME_GLITCH) {
+      const h = hash2(start * 7.3 + fixed, fixed * 3.1 + start, tick);
+      if (h < 0.2) return;
+      if (h > 0.9) {
+        const flash = this.flashPalettes[mi];
+        if (flash) palette = Engine.flatPalette(flash);
+      }
+    }
+
+    const a = horizontal ? new Vector3(start, 0, fixed) : new Vector3(fixed, 0, start);
+    const b = horizontal ? new Vector3(end, 0, fixed) : new Vector3(fixed, 0, end);
+    this.drawWorldLine(a, b, viewProj, major, palette);
+  }
+
+  private static flatPalette(color: string): string[] {
+    return new Array<string>(FOG_LEVELS).fill(color);
+  }
+
+  private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, major: boolean, palette: string[]): void {
     let ca = viewProj.transformPointWithW(a);
     let cb = viewProj.transformPointWithW(b);
     if (ca.w <= NEAR && cb.w <= NEAR) return;
@@ -1007,14 +1272,6 @@ export class Engine {
     const sa = this.toScreen(ca);
     const sb = this.toScreen(cb);
 
-    const dimmed = this.isInventoryOpen;
-    const palette = major
-      ? dimmed
-        ? this.dimMajorPalette
-        : this.majorPalette
-      : dimmed
-        ? this.dimMinorPalette
-        : this.minorPalette;
     const fogStart = this.fogStart;
     const invRange = 1 / (this.fogEnd - this.fogStart);
     const shade = (z: number): string | null => {
@@ -1047,9 +1304,22 @@ export class Engine {
     scale: number = 1,
     minIntensity: number = 0
   ): void {
-    const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF * scale, pos.z)
+    this.drawBox(viewProj, pos, facing, rgb, scale, scale, scale, minIntensity);
+  }
+
+  private drawBox(
+    viewProj: Matrix4,
+    pos: Vector3,
+    facing: number,
+    rgb: Rgb,
+    sx: number,
+    sy: number,
+    sz: number,
+    minIntensity: number = 0
+  ): void {
+    const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF * sy, pos.z)
       .multiply(Matrix4.rotationY(facing))
-      .multiply(Matrix4.scaling(scale, scale, scale));
+      .multiply(Matrix4.scaling(sx, sy, sz));
 
     const world: Vector3[] = [];
     const screen: Array<ScreenVertex | null> = [];
@@ -1181,7 +1451,7 @@ export class Engine {
   private drawUI(): void {
     const r = this.renderer;
 
-    r.fillRect(0, 0, 40, 6, '#000000');
+    r.fillRect(0, 0, 40, 7, '#000000');
 
     r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
     r.drawRawText(
@@ -1221,5 +1491,12 @@ export class Engine {
       `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.attackDamage}`,
       '#00ffff'
     );
+
+    const biome = this.biomeAtPos(this.playerPos.x, this.playerPos.z);
+    const biomeText =
+      biome === BIOME_ACID
+        ? `BIOME: ${BIOME_NAMES[biome]}  !! -${ACID_DAMAGE} HP/s`
+        : `BIOME: ${BIOME_NAMES[biome] ?? 'UNKNOWN'}`;
+    r.drawRawText(1, 6, biomeText, BIOME_UI_COLORS[biome] ?? '#00ff9c');
   }
 }
