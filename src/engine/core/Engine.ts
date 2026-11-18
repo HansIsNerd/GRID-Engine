@@ -32,6 +32,14 @@ interface InventoryItem {
   detail: string;
 }
 
+type Item = InventoryItem;
+
+interface Loot {
+  pos: Vector3;
+  item: Item;
+  age: number;
+}
+
 interface InventoryLayout {
   panelX: number;
   panelY: number;
@@ -74,15 +82,43 @@ const NPC_SPEED = 3.5;
 const NPC_ATTACK_DAMAGE = 10;
 const NPC_ATTACK_COOLDOWN = 1;
 
+const NPC_RESPAWN_TIME = 5;
+const NPC_RESPAWN_HP = 50;
+const NPC_RESPAWN_MIN_DIST = 20;
+const NPC_RESPAWN_MARGIN = 3;
+const NPC_RESPAWN_TRIES = 30;
+
+const LOOT_SCALE = 0.3;
+const LOOT_PICKUP_RANGE = 1.2;
+const LOOT_BOB_HEIGHT = 0.5;
+const LOOT_BOB_AMPLITUDE = 0.15;
+const LOOT_BOB_SPEED = 3;
+const LOOT_SPIN_SPEED = 2;
+const LOOT_GLOW_MIN_INTENSITY = 0.85;
+const MAX_LOOT = 64;
+const LOOT_RGB: Rgb = { r: 255, g: 220, b: 40 };
+
 const GRAVITY = 9.8;
 const SPARK_MIN = 5;
 const SPARK_MAX = 8;
 const SPARK_LIFE = 0.6;
 const INDICATOR_LIFE = 0.9;
+const PICKUP_MIN = 8;
+const PICKUP_MAX = 12;
+const PICKUP_LIFE = 0.7;
 const PARTICLE_DEPTH_BIAS = 0.3;
 const MAX_PARTICLES = 512;
 const SPARK_COLORS: string[] = ['#ffffff', '#ffee55', '#ffd028'];
 const BLOOD_COLORS: string[] = ['#ff0000', '#ff2020', '#ff5555'];
+const PICKUP_COLORS: string[] = ['#00ff9c', '#55ff88', '#aaffcc'];
+
+const LOOT_POOL: Item[] = [
+  { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12' },
+  { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP' },
+  { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 MP' },
+  { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50' },
+  { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6' },
+];
 
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
 const NPC_RGB: Rgb = { r: 255, g: 40, b: 160 };
@@ -118,12 +154,15 @@ export class Engine {
 
   private readonly npcPos: Vector3;
   private npcHealth: number;
+  private npcMaxHp: number;
   private npcHitTimer: number;
   private npcState: NpcState;
   private npcAttackCooldown: number;
   private npcFacing: number;
+  private npcRespawnTimer: number;
 
   private readonly particles: Particle[];
+  private readonly lootItems: Loot[];
 
   private isInventoryOpen: boolean;
   private readonly inventoryItems: Array<InventoryItem | null>;
@@ -160,12 +199,15 @@ export class Engine {
 
     this.npcPos = new Vector3(NPC_START_X, 0, NPC_START_Z);
     this.npcHealth = NPC_MAX_HP;
+    this.npcMaxHp = NPC_MAX_HP;
     this.npcHitTimer = 0;
     this.npcState = 'idle';
     this.npcAttackCooldown = 0;
     this.npcFacing = 0;
+    this.npcRespawnTimer = 0;
 
     this.particles = [];
+    this.lootItems = [];
 
     this.isInventoryOpen = false;
     this.hoverSlot = -1;
@@ -310,6 +352,27 @@ export class Engine {
     }
   }
 
+  private spawnPickupEffect(pos: Vector3): void {
+    const origin = new Vector3(pos.x, pos.y + LOOT_BOB_HEIGHT, pos.z);
+    const count = PICKUP_MIN + Math.floor(Math.random() * (PICKUP_MAX - PICKUP_MIN + 1));
+
+    for (let i = 0; i < count; i++) {
+      if (this.particles.length >= MAX_PARTICLES) break;
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1 + Math.random() * 2.5;
+      const life = PICKUP_LIFE * (0.6 + Math.random() * 0.4);
+      this.particles.push({
+        pos: origin.clone(),
+        vel: new Vector3(Math.cos(angle) * speed, 2 + Math.random() * 3, Math.sin(angle) * speed),
+        life,
+        maxLife: life,
+        char: '+',
+        color: PICKUP_COLORS[Math.floor(Math.random() * PICKUP_COLORS.length)] ?? '#00ff9c',
+        gravity: GRAVITY * 0.5,
+      });
+    }
+  }
+
   private updateParticles(dt: number): void {
     for (let i = this.particles.length - 1; i >= 0; i--) {
       const p = this.particles[i];
@@ -335,6 +398,82 @@ export class Engine {
         p.vel.z *= 0.5;
       }
     }
+  }
+
+  private spawnLoot(pos: Vector3): void {
+    if (this.lootItems.length >= MAX_LOOT) return;
+    const template = LOOT_POOL[Math.floor(Math.random() * LOOT_POOL.length)] ?? LOOT_POOL[0];
+    if (!template) return;
+    this.lootItems.push({
+      pos: new Vector3(pos.x, 0, pos.z),
+      item: { ...template },
+      age: 0,
+    });
+  }
+
+  private firstEmptySlot(): number {
+    for (let i = 0; i < this.inventoryItems.length; i++) {
+      if (this.inventoryItems[i] === null) return i;
+    }
+    return -1;
+  }
+
+  private updateLoot(dt: number): void {
+    for (let i = this.lootItems.length - 1; i >= 0; i--) {
+      const loot = this.lootItems[i];
+      if (!loot) continue;
+
+      loot.age += dt;
+
+      const dx = loot.pos.x - this.playerPos.x;
+      const dz = loot.pos.z - this.playerPos.z;
+      if (Math.sqrt(dx * dx + dz * dz) >= LOOT_PICKUP_RANGE) continue;
+
+      const slot = this.firstEmptySlot();
+      if (slot < 0) continue;
+
+      this.inventoryItems[slot] = loot.item;
+      this.spawnPickupEffect(loot.pos);
+      this.lootItems.splice(i, 1);
+    }
+  }
+
+  private randomNpcSpawn(): Vector3 {
+    const range = GRID_HALF - NPC_RESPAWN_MARGIN;
+    let best = new Vector3(-this.playerPos.x, 0, -this.playerPos.z);
+    let bestDist = -1;
+
+    for (let i = 0; i < NPC_RESPAWN_TRIES; i++) {
+      const x = (Math.random() * 2 - 1) * range;
+      const z = (Math.random() * 2 - 1) * range;
+      const dx = x - this.playerPos.x;
+      const dz = z - this.playerPos.z;
+      const d = Math.sqrt(dx * dx + dz * dz);
+      if (d >= NPC_RESPAWN_MIN_DIST) return new Vector3(x, 0, z);
+      if (d > bestDist) {
+        bestDist = d;
+        best = new Vector3(x, 0, z);
+      }
+    }
+    return best;
+  }
+
+  private updateNpcRespawn(dt: number): void {
+    if (this.npcAlive()) return;
+
+    this.npcRespawnTimer -= dt;
+    if (this.npcRespawnTimer > 0) return;
+
+    const spawn = this.randomNpcSpawn();
+    this.npcPos.x = spawn.x;
+    this.npcPos.y = 0;
+    this.npcPos.z = spawn.z;
+    this.npcMaxHp = NPC_RESPAWN_HP;
+    this.npcHealth = NPC_RESPAWN_HP;
+    this.npcState = 'idle';
+    this.npcAttackCooldown = 0;
+    this.npcHitTimer = 0;
+    this.npcRespawnTimer = 0;
   }
 
   private updateNpc(dt: number): void {
@@ -383,6 +522,7 @@ export class Engine {
     this.facing = 0;
     this.cameraPos = this.playerPos.add(this.cameraOffset);
 
+    this.npcMaxHp = NPC_MAX_HP;
     this.npcHealth = NPC_MAX_HP;
     this.npcPos.x = NPC_START_X;
     this.npcPos.y = 0;
@@ -391,6 +531,9 @@ export class Engine {
     this.npcAttackCooldown = 0;
     this.npcHitTimer = 0;
     this.npcFacing = 0;
+    this.npcRespawnTimer = 0;
+
+    this.lootItems.length = 0;
   }
 
   private getInventoryLayout(): InventoryLayout {
@@ -472,6 +615,10 @@ export class Engine {
         this.npcHealth = Math.max(0, this.npcHealth - ATTACK_DAMAGE);
         this.npcHitTimer = HIT_FLASH_TIME;
         this.spawnHitEffect(this.npcPos, SPARK_COLORS);
+        if (this.npcHealth <= 0) {
+          this.spawnLoot(this.npcPos);
+          this.npcRespawnTimer = NPC_RESPAWN_TIME;
+        }
       }
     }
     this.input.actionJustPressed = false;
@@ -479,9 +626,11 @@ export class Engine {
     if (this.npcHitTimer > 0) this.npcHitTimer = Math.max(0, this.npcHitTimer - dt);
 
     this.updateNpc(dt);
+    this.updateNpcRespawn(dt);
 
     if (this.playerHealth <= 0) this.respawn();
 
+    this.updateLoot(dt);
     this.updateParticles(dt);
 
     const desired = this.playerPos.add(this.cameraOffset);
@@ -502,6 +651,7 @@ export class Engine {
     const dim = this.isInventoryOpen ? DIM_FACTOR : 1;
 
     this.drawFloor(viewProj);
+    this.drawLoot(viewProj, dim);
     if (this.npcAlive()) {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
       this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
@@ -516,6 +666,22 @@ export class Engine {
     if (this.isInventoryOpen) this.drawInventory();
 
     r.present();
+  }
+
+  private drawLoot(viewProj: Matrix4, dim: number): void {
+    for (const loot of this.lootItems) {
+      const pulse = 0.8 + 0.2 * Math.sin(loot.age * 6);
+      const bob = LOOT_BOB_HEIGHT + Math.sin(loot.age * LOOT_BOB_SPEED) * LOOT_BOB_AMPLITUDE;
+      const pos = new Vector3(loot.pos.x, loot.pos.y + bob, loot.pos.z);
+      this.drawCube(
+        viewProj,
+        pos,
+        loot.age * LOOT_SPIN_SPEED,
+        { r: LOOT_RGB.r * pulse * dim, g: LOOT_RGB.g * pulse * dim, b: LOOT_RGB.b * pulse * dim },
+        LOOT_SCALE,
+        LOOT_GLOW_MIN_INTENSITY
+      );
+    }
   }
 
   private drawParticles(viewProj: Matrix4): void {
@@ -595,8 +761,17 @@ export class Engine {
     );
   }
 
-  private drawCube(viewProj: Matrix4, pos: Vector3, facing: number, rgb: Rgb): void {
-    const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF, pos.z).multiply(Matrix4.rotationY(facing));
+  private drawCube(
+    viewProj: Matrix4,
+    pos: Vector3,
+    facing: number,
+    rgb: Rgb,
+    scale: number = 1,
+    minIntensity: number = 0
+  ): void {
+    const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF * scale, pos.z)
+      .multiply(Matrix4.rotationY(facing))
+      .multiply(Matrix4.scaling(scale, scale, scale));
 
     const world: Vector3[] = [];
     const screen: Array<ScreenVertex | null> = [];
@@ -627,7 +802,7 @@ export class Engine {
       if (normal.dot(this.cameraPos.subtract(center)) <= 0) continue;
 
       const diffuse = Math.max(0, normal.dot(this.lightDir));
-      const intensity = Math.min(1, 0.15 + 0.85 * diffuse);
+      const intensity = Math.min(1, Math.max(minIntensity, 0.15 + 0.85 * diffuse));
 
       const rampIndex = Math.min(ASCII_RAMP.length - 1, Math.floor(intensity * ASCII_RAMP.length));
       const char = ASCII_RAMP.charAt(rampIndex);
@@ -749,10 +924,10 @@ export class Engine {
 
     if (this.npcAlive()) {
       if (this.distanceToNpc() < TARGET_UI_RANGE) {
-        r.drawRawText(1, 3, `ENEMY HP:  ${this.npcHealth}/${NPC_MAX_HP}`, '#ff2fa0');
+        r.drawRawText(1, 3, `ENEMY HP:  ${this.npcHealth}/${this.npcMaxHp}`, '#ff2fa0');
       }
     } else {
-      r.drawRawText(1, 3, 'ENEMY DEFEATED', '#2a7a5a');
+      r.drawRawText(1, 3, `ENEMY DEFEATED  RESPAWN: ${Math.max(0, Math.ceil(this.npcRespawnTimer))}s`, '#2a7a5a');
     }
 
     r.drawRawText(
