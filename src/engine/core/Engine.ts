@@ -26,11 +26,15 @@ interface Particle {
   gravity: number;
 }
 
+type ItemKind = 'weapon' | 'armor' | 'potion' | 'ram' | 'core' | 'misc';
+
 interface InventoryItem {
   name: string;
   char: string;
   color: string;
   detail: string;
+  kind: ItemKind;
+  value: number;
 }
 
 type Item = InventoryItem;
@@ -90,6 +94,7 @@ const BIOME_ACID = 2;
 const BIOME_GLITCH = 3;
 const BIOME_NAMES: string[] = ['DATA WASTES', 'NEON CITY', 'ACID POOL', 'GLITCH ZONE'];
 const BIOME_UI_COLORS: string[] = ['#00ff9c', '#00ffff', '#d0ff00', '#ff2040'];
+const GLITCH_CHARS = '#$%&@!?0123456789<>/\\';
 
 const WORLD_SEED = 1337;
 const SAFE_RADIUS = 9;
@@ -171,6 +176,28 @@ const EXP_GROWTH = 1.5;
 const CYBER_CORE_ATTACK_BONUS = 5;
 const CYBER_CORE_NAME = 'Cyber-Core';
 
+const RAM_MAX = 100;
+const RAM_REGEN = 6;
+const GLITCH_RAM = 20;
+const BOMB_COST = 30;
+const BOMB_RADIUS = 6;
+const BOMB_DAMAGE_BASE = 40;
+const BOMB_DAMAGE_PER_LEVEL = 5;
+const BLINK_COST = 20;
+const BLINK_DISTANCE = 6;
+const BLINK_STEPS = 12;
+const OVERCLOCK_COST = 50;
+const OVERCLOCK_TIME = 8;
+const OVERCLOCK_MULT = 2;
+const SHAKE_AMP = 0.3;
+const GLITCH_ROWS = 6;
+const GLITCH_SHIFT = 3;
+const MESSAGE_TIME = 2;
+const SAVE_KEY = 'grid_save_v1';
+const BOMB_COLORS: string[] = ['#33aaff', '#66ccff', '#ccf0ff'];
+const BLINK_COLORS: string[] = ['#b266ff', '#d199ff', '#ffffff'];
+const OVERCLOCK_COLORS: string[] = ['#ff9020', '#ffd028', '#ffffff'];
+
 const PULSE_DURATION = 1.0;
 const PULSE_MAX_RADIUS = 12;
 const PULSE_DAMAGE_BASE = 20;
@@ -196,11 +223,11 @@ const BLOOD_COLORS: string[] = ['#ff0000', '#ff2020', '#ff5555'];
 const PICKUP_COLORS: string[] = ['#00ff9c', '#55ff88', '#aaffcc'];
 
 const LOOT_POOL: Item[] = [
-  { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12' },
-  { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP' },
-  { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 MP' },
-  { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50' },
-  { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6' },
+  { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', kind: 'weapon', value: 12 },
+  { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', kind: 'potion', value: 40 },
+  { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', kind: 'ram', value: 25 },
+  { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50', kind: 'misc', value: 50 },
+  { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6', kind: 'armor', value: 6 },
 ];
 
 const CYBER_CORE_TEMPLATE: Item = {
@@ -208,6 +235,8 @@ const CYBER_CORE_TEMPLATE: Item = {
   char: 'C',
   color: '#00ffff',
   detail: 'Click: ATK +5',
+  kind: 'core',
+  value: CYBER_CORE_ATTACK_BONUS,
 };
 
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
@@ -234,6 +263,19 @@ const INV_BORDER_HOVER = '#ffffff';
 const INV_TITLE = '#00ff9c';
 const INV_INFO = '#00d4ff';
 
+function isItem(v: unknown): v is Item {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o['name'] === 'string' &&
+    typeof o['char'] === 'string' &&
+    typeof o['color'] === 'string' &&
+    typeof o['detail'] === 'string' &&
+    typeof o['kind'] === 'string' &&
+    typeof o['value'] === 'number'
+  );
+}
+
 export class Engine {
   private readonly renderer: AsciiRenderer;
   private readonly input: Input;
@@ -245,7 +287,16 @@ export class Engine {
   private playerExp: number;
   private playerLevel: number;
   private expToNextLevel: number;
-  private attackDamage: number;
+  private coreBonus: number;
+
+  private ram: number;
+  private overclockTimer: number;
+  private glitching: boolean;
+  private message: string;
+  private messageTimer: number;
+
+  private equippedWeapon: Item | null;
+  private equippedArmor: Item | null;
 
   private readonly npcPos: Vector3;
   private npcHealth: number;
@@ -305,7 +356,16 @@ export class Engine {
     this.playerExp = 0;
     this.playerLevel = START_LEVEL;
     this.expToNextLevel = START_EXP_TO_NEXT;
-    this.attackDamage = BASE_ATTACK_DAMAGE;
+    this.coreBonus = 0;
+
+    this.ram = RAM_MAX;
+    this.overclockTimer = 0;
+    this.glitching = false;
+    this.message = '';
+    this.messageTimer = 0;
+
+    this.equippedWeapon = null;
+    this.equippedArmor = null;
 
     this.npcPos = new Vector3(NPC_START_X, 0, NPC_START_Z);
     this.npcHealth = NPC_MAX_HP;
@@ -328,12 +388,12 @@ export class Engine {
     this.isInventoryOpen = false;
     this.hoverSlot = -1;
     this.inventoryItems = new Array<InventoryItem | null>(INV_COLS * INV_ROWS).fill(null);
-    this.inventoryItems[0] = { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12' };
-    this.inventoryItems[1] = { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP' };
-    this.inventoryItems[2] = { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 120' };
-    this.inventoryItems[5] = { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 MP' };
-    this.inventoryItems[7] = { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6' };
-    this.inventoryItems[10] = { name: 'Ancient Key', char: 'k', color: '#b266ff', detail: 'Opens something' };
+    this.inventoryItems[0] = { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', kind: 'weapon', value: 12 };
+    this.inventoryItems[1] = { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', kind: 'potion', value: 40 };
+    this.inventoryItems[2] = { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 120', kind: 'misc', value: 120 };
+    this.inventoryItems[5] = { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', kind: 'ram', value: 25 };
+    this.inventoryItems[7] = { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6', kind: 'armor', value: 6 };
+    this.inventoryItems[10] = { name: 'Ancient Key', char: 'k', color: '#b266ff', detail: 'Opens something', kind: 'misc', value: 0 };
 
     this.pitch = CAMERA_PITCH;
     this.yaw = 0;
@@ -402,6 +462,9 @@ export class Engine {
     this.lastTime = 0;
     this.fps = 60;
     this.running = false;
+
+    this.loadGame();
+    this.cameraPos = this.playerPos.add(this.cameraOffset);
   }
 
   private static buildPalette(rgb: Rgb, scale: number): string[] {
@@ -548,6 +611,70 @@ export class Engine {
     return false;
   }
 
+  private showMessage(text: string): void {
+    this.message = text;
+    this.messageTimer = MESSAGE_TIME;
+  }
+
+  private saveGame(): void {
+    const data = {
+      x: this.playerPos.x,
+      z: this.playerPos.z,
+      hp: this.playerHealth,
+      ram: this.ram,
+      level: this.playerLevel,
+      exp: this.playerExp,
+      expToNext: this.expToNextLevel,
+      coreBonus: this.coreBonus,
+      inv: this.inventoryItems,
+      weapon: this.equippedWeapon,
+      armor: this.equippedArmor,
+    };
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify(data));
+      this.showMessage('GAME SAVED');
+    } catch {
+      this.showMessage('SAVE FAILED');
+    }
+  }
+
+  private loadGame(): void {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return;
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed !== 'object' || parsed === null) return;
+      const o = parsed as Record<string, unknown>;
+      const num = (k: string, f: number): number => {
+        const v = o[k];
+        return typeof v === 'number' && Number.isFinite(v) ? v : f;
+      };
+
+      this.playerPos.x = Math.max(-GRID_HALF, Math.min(GRID_HALF, num('x', 0)));
+      this.playerPos.z = Math.max(-GRID_HALF, Math.min(GRID_HALF, num('z', 0)));
+      this.playerHealth = Math.max(1, Math.min(PLAYER_MAX_HP, num('hp', PLAYER_MAX_HP)));
+      this.ram = Math.max(0, Math.min(RAM_MAX, num('ram', RAM_MAX)));
+      this.playerLevel = Math.max(1, Math.floor(num('level', START_LEVEL)));
+      this.playerExp = Math.max(0, num('exp', 0));
+      this.expToNextLevel = Math.max(1, num('expToNext', START_EXP_TO_NEXT));
+      this.coreBonus = Math.max(0, num('coreBonus', 0));
+
+      const inv = o['inv'];
+      if (Array.isArray(inv)) {
+        for (let i = 0; i < this.inventoryItems.length; i++) {
+          const it: unknown = inv[i];
+          this.inventoryItems[i] = isItem(it) ? it : null;
+        }
+      }
+      const w = o['weapon'];
+      this.equippedWeapon = isItem(w) && w.kind === 'weapon' ? w : null;
+      const a = o['armor'];
+      this.equippedArmor = isItem(a) && a.kind === 'armor' ? a : null;
+    } catch {
+      return;
+    }
+  }
+
   public start(): void {
     if (this.running) return;
     this.running = true;
@@ -590,6 +717,19 @@ export class Engine {
     const dx = this.npcPos.x - this.playerPos.x;
     const dz = this.npcPos.z - this.playerPos.z;
     return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  private currentAttack(): number {
+    const base = BASE_ATTACK_DAMAGE + this.coreBonus + (this.equippedWeapon?.value ?? 0);
+    return base * (this.overclockTimer > 0 ? OVERCLOCK_MULT : 1);
+  }
+
+  private damageNpc(amount: number, colors: string[]): void {
+    if (!this.npcAlive()) return;
+    this.npcHealth = Math.max(0, this.npcHealth - amount);
+    this.npcHitTimer = HIT_FLASH_TIME;
+    this.spawnHitEffect(this.npcPos, colors);
+    if (this.npcHealth <= 0) this.killNpc();
   }
 
   private spawnHitEffect(pos: Vector3, colors: string[]): void {
@@ -806,10 +946,48 @@ export class Engine {
     if (dist > this.pulseRadius()) return;
 
     this.pulseHitNpc = true;
-    this.npcHealth = Math.max(0, this.npcHealth - this.pulseDamage);
-    this.npcHitTimer = HIT_FLASH_TIME;
-    this.spawnHitEffect(this.npcPos, EXP_PICKUP_COLORS);
-    if (this.npcHealth <= 0) this.killNpc();
+    this.damageNpc(this.pulseDamage, EXP_PICKUP_COLORS);
+  }
+
+  private castLogicBomb(): void {
+    if (this.ram < BOMB_COST) return;
+    this.ram -= BOMB_COST;
+    for (let i = 0; i < 3; i++) this.spawnPickupEffect(this.playerPos, BOMB_COLORS);
+    if (this.npcAlive() && this.distanceToNpc() <= BOMB_RADIUS) {
+      this.damageNpc(BOMB_DAMAGE_BASE + BOMB_DAMAGE_PER_LEVEL * this.playerLevel, BOMB_COLORS);
+    }
+  }
+
+  private castDataBlink(): void {
+    if (this.ram < BLINK_COST) return;
+    const dirX = Math.sin(this.facing);
+    const dirZ = Math.cos(this.facing);
+    const stepLen = BLINK_DISTANCE / BLINK_STEPS;
+    const ox = this.playerPos.x;
+    const oz = this.playerPos.z;
+    let x = ox;
+    let z = oz;
+    for (let i = 1; i <= BLINK_STEPS; i++) {
+      const nx = Math.max(-GRID_HALF, Math.min(GRID_HALF, ox + dirX * stepLen * i));
+      const nz = Math.max(-GRID_HALF, Math.min(GRID_HALF, oz + dirZ * stepLen * i));
+      if (this.blockedByObstacle(nx, nz) || this.collidesWithNpc(nx, nz)) break;
+      x = nx;
+      z = nz;
+    }
+    if (x === ox && z === oz) return;
+    this.ram -= BLINK_COST;
+    this.spawnPickupEffect(new Vector3(ox, 0, oz), BLINK_COLORS);
+    this.playerPos.x = x;
+    this.playerPos.z = z;
+    this.spawnPickupEffect(this.playerPos, BLINK_COLORS);
+    this.cameraPos = this.playerPos.add(this.cameraOffset);
+  }
+
+  private castOverclock(): void {
+    if (this.ram < OVERCLOCK_COST) return;
+    this.ram -= OVERCLOCK_COST;
+    this.overclockTimer = OVERCLOCK_TIME;
+    this.spawnPickupEffect(this.playerPos, OVERCLOCK_COLORS);
   }
 
   private randomNpcSpawn(): Vector3 {
@@ -887,7 +1065,8 @@ export class Engine {
     this.npcFacing += diff * (1 - Math.exp(-10 * dt));
 
     if (this.distanceToNpc() < NPC_ATTACK_RANGE && this.npcAttackCooldown <= 0) {
-      this.playerHealth = Math.max(0, this.playerHealth - NPC_ATTACK_DAMAGE);
+      const dmg = Math.max(1, NPC_ATTACK_DAMAGE - (this.equippedArmor?.value ?? 0));
+      this.playerHealth = Math.max(0, this.playerHealth - dmg);
       this.npcAttackCooldown = NPC_ATTACK_COOLDOWN;
       this.spawnHitEffect(this.playerPos, BLOOD_COLORS);
     }
@@ -908,6 +1087,8 @@ export class Engine {
 
   private respawn(): void {
     this.playerHealth = PLAYER_MAX_HP;
+    this.ram = RAM_MAX;
+    this.overclockTimer = 0;
     this.playerPos.x = 0;
     this.playerPos.y = 0;
     this.playerPos.z = 0;
@@ -970,52 +1151,85 @@ export class Engine {
     return sr * INV_COLS + sc;
   }
 
-  private handleInventoryClick(): void {
-    if (!this.input.actionJustPressed) return;
-    if (this.hoverSlot < 0) return;
+  private handleInventoryClick(click: boolean): void {
+    if (!click || this.hoverSlot < 0) return;
 
-    const item = this.inventoryItems[this.hoverSlot];
-    if (!item || item.name !== CYBER_CORE_NAME) return;
+    const slot = this.hoverSlot;
+    const item = this.inventoryItems[slot];
+    if (!item) return;
 
-    this.attackDamage += CYBER_CORE_ATTACK_BONUS;
-    this.inventoryItems[this.hoverSlot] = null;
-
-    this.isInventoryOpen = false;
-    this.hoverSlot = -1;
+    if (item.kind === 'weapon') {
+      this.inventoryItems[slot] = this.equippedWeapon;
+      this.equippedWeapon = item;
+    } else if (item.kind === 'armor') {
+      this.inventoryItems[slot] = this.equippedArmor;
+      this.equippedArmor = item;
+    } else if (item.kind === 'potion') {
+      this.playerHealth = Math.min(PLAYER_MAX_HP, this.playerHealth + item.value);
+      this.inventoryItems[slot] = null;
+    } else if (item.kind === 'ram') {
+      this.ram = Math.min(RAM_MAX, this.ram + item.value);
+      this.inventoryItems[slot] = null;
+    } else if (item.kind === 'core') {
+      this.coreBonus += item.value;
+      this.inventoryItems[slot] = null;
+      this.isInventoryOpen = false;
+      this.hoverSlot = -1;
+    }
   }
 
   private update(dt: number): void {
     this.time += dt;
 
-    if (this.input.inventoryJustPressed) {
+    const inp = this.input;
+    const invToggle = inp.inventoryJustPressed;
+    const click = inp.actionJustPressed;
+    const space = inp.spaceJustPressed;
+    const qPressed = inp.qJustPressed;
+    const ePressed = inp.eJustPressed;
+    const rPressed = inp.rJustPressed;
+    const savePressed = inp.saveJustPressed;
+    inp.resetJustPressed();
+
+    if (savePressed) this.saveGame();
+    if (this.messageTimer > 0) this.messageTimer = Math.max(0, this.messageTimer - dt);
+
+    if (invToggle) {
       this.isInventoryOpen = !this.isInventoryOpen;
       this.hoverSlot = -1;
     }
-    this.input.inventoryJustPressed = false;
 
     if (this.isInventoryOpen) {
       this.hoverSlot = this.slotAtMouse();
-      this.handleInventoryClick();
-      this.input.actionJustPressed = false;
+      this.handleInventoryClick(click);
       return;
     }
 
+    this.ram = Math.min(RAM_MAX, this.ram + RAM_REGEN * dt);
+    this.glitching = this.ram < GLITCH_RAM;
+    if (this.overclockTimer > 0) this.overclockTimer = Math.max(0, this.overclockTimer - dt);
+
+    if (qPressed) this.castLogicBomb();
+    if (ePressed) this.castDataBlink();
+    if (rPressed) this.castOverclock();
+
     let dx = 0;
     let dz = 0;
-    if (this.input.forward) dz -= 1;
-    if (this.input.backward) dz += 1;
-    if (this.input.left) dx -= 1;
-    if (this.input.right) dx += 1;
+    if (inp.forward) dz -= 1;
+    if (inp.backward) dz += 1;
+    if (inp.left) dx -= 1;
+    if (inp.right) dx += 1;
 
     if (dx !== 0 || dz !== 0) {
       const dir = new Vector3(dx, 0, dz).normalize();
+      const speed = MOVE_SPEED * (this.overclockTimer > 0 ? OVERCLOCK_MULT : 1);
 
-      const nextX = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.x + dir.x * MOVE_SPEED * dt));
+      const nextX = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.x + dir.x * speed * dt));
       if (!this.collidesWithNpc(nextX, this.playerPos.z) && !this.blockedByObstacle(nextX, this.playerPos.z)) {
         this.playerPos.x = nextX;
       }
 
-      const nextZ = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.z + dir.z * MOVE_SPEED * dt));
+      const nextZ = Math.max(-GRID_HALF, Math.min(GRID_HALF, this.playerPos.z + dir.z * speed * dt));
       if (!this.collidesWithNpc(this.playerPos.x, nextZ) && !this.blockedByObstacle(this.playerPos.x, nextZ)) {
         this.playerPos.z = nextZ;
       }
@@ -1027,15 +1241,9 @@ export class Engine {
       this.facing += diff * (1 - Math.exp(-14 * dt));
     }
 
-    if (this.input.actionJustPressed && this.npcAlive()) {
-      if (this.distanceToNpc() < ATTACK_RANGE) {
-        this.npcHealth = Math.max(0, this.npcHealth - this.attackDamage);
-        this.npcHitTimer = HIT_FLASH_TIME;
-        this.spawnHitEffect(this.npcPos, SPARK_COLORS);
-        if (this.npcHealth <= 0) this.killNpc();
-      }
+    if ((click || space) && this.npcAlive() && this.distanceToNpc() < ATTACK_RANGE) {
+      this.damageNpc(this.currentAttack(), SPARK_COLORS);
     }
-    this.input.actionJustPressed = false;
 
     if (this.npcHitTimer > 0) this.npcHitTimer = Math.max(0, this.npcHitTimer - dt);
 
@@ -1059,10 +1267,19 @@ export class Engine {
     const r = this.renderer;
     r.clear();
 
+    const shaking = this.glitching && !this.isInventoryOpen;
+    const shakeX = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
+    const shakeY = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
+    const shakeZ = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
+
     const proj = Matrix4.perspective(FOV, r.getAspect(), NEAR, FAR);
     const rotX = Matrix4.rotationX(-this.pitch);
     const rotY = Matrix4.rotationY(-this.yaw);
-    const trans = Matrix4.translation(-this.cameraPos.x, -this.cameraPos.y, -this.cameraPos.z);
+    const trans = Matrix4.translation(
+      -(this.cameraPos.x + shakeX),
+      -(this.cameraPos.y + shakeY),
+      -(this.cameraPos.z + shakeZ)
+    );
     const viewProj = proj.multiply(rotX).multiply(rotY).multiply(trans);
 
     const dim = this.isInventoryOpen ? DIM_FACTOR : 1;
@@ -1082,6 +1299,7 @@ export class Engine {
     });
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
+    if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
     this.drawUI();
     if (this.isInventoryOpen) this.drawInventory();
 
@@ -1236,25 +1454,30 @@ export class Engine {
     let palette = this.floorPalettes[biome * 4 + mi];
     if (!palette) return;
 
-    if (biome === BIOME_GLITCH) {
+    let ch = major ? '+' : '.';
+    if (biome === BIOME_ACID) {
+      ch = '~';
+    } else if (biome === BIOME_GLITCH) {
       const h = hash2(start * 7.3 + fixed, fixed * 3.1 + start, tick);
       if (h < 0.2) return;
       if (h > 0.9) {
         const flash = this.flashPalettes[mi];
         if (flash) palette = Engine.flatPalette(flash);
       }
+      const hc = hash2(start * 3.7 + fixed, fixed * 5.3, tick + 11);
+      ch = GLITCH_CHARS.charAt(Math.floor(hc * GLITCH_CHARS.length));
     }
 
     const a = horizontal ? new Vector3(start, 0, fixed) : new Vector3(fixed, 0, start);
     const b = horizontal ? new Vector3(end, 0, fixed) : new Vector3(fixed, 0, end);
-    this.drawWorldLine(a, b, viewProj, major, palette);
+    this.drawWorldLine(a, b, viewProj, ch, palette);
   }
 
   private static flatPalette(color: string): string[] {
     return new Array<string>(FOG_LEVELS).fill(color);
   }
 
-  private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, major: boolean, palette: string[]): void {
+  private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, ch: string, palette: string[]): void {
     let ca = viewProj.transformPointWithW(a);
     let cb = viewProj.transformPointWithW(b);
     if (ca.w <= NEAR && cb.w <= NEAR) return;
@@ -1283,17 +1506,7 @@ export class Engine {
     const fallback = palette[FOG_LEVELS - 1] ?? '#00ff9c';
 
     const bias = 0.02;
-    this.renderer.drawLine(
-      sa.x,
-      sa.y,
-      sb.x,
-      sb.y,
-      major ? '+' : '.',
-      fallback,
-      sa.z + bias,
-      sb.z + bias,
-      shade
-    );
+    this.renderer.drawLine(sa.x, sa.y, sb.x, sb.y, ch, fallback, sa.z + bias, sb.z + bias, shade);
   }
 
   private drawCube(
@@ -1415,6 +1628,14 @@ export class Engine {
       INV_TITLE
     );
 
+    const equip = `WPN: ${this.equippedWeapon?.name ?? '-'}  ARM: ${this.equippedArmor?.name ?? '-'}`;
+    r.drawRawText(
+      layout.panelX + Math.max(0, Math.floor((layout.panelW - equip.length) / 2)),
+      layout.panelY + 2,
+      equip,
+      INV_INFO
+    );
+
     for (let i = 0; i < INV_COLS * INV_ROWS; i++) {
       const sc = i % INV_COLS;
       const sr = Math.floor(i / INV_COLS);
@@ -1444,14 +1665,14 @@ export class Engine {
       r.drawRawText(layout.panelX + Math.floor((layout.panelW - text.length) / 2), infoY - 1, text, hovered.color);
     }
 
-    const hint = 'CLOSE: I';
+    const hint = 'CLICK: USE/EQUIP  CLOSE: I';
     r.drawRawText(layout.panelX + Math.floor((layout.panelW - hint.length) / 2), infoY, hint, INV_INFO);
   }
 
   private drawUI(): void {
     const r = this.renderer;
 
-    r.fillRect(0, 0, 40, 7, '#000000');
+    r.fillRect(0, 0, 50, 10, '#000000');
 
     r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
     r.drawRawText(
@@ -1481,14 +1702,14 @@ export class Engine {
     r.drawRawText(
       1,
       4,
-      this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'MOVE: WASD  ATTACK: LMB  INVENTORY: I',
+      this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'WASD LMB/SPC Q/E/R I:INV P:SAVE',
       '#2a7a5a'
     );
 
     r.drawRawText(
       1,
       5,
-      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.attackDamage}`,
+      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.currentAttack()}`,
       '#00ffff'
     );
 
@@ -1498,5 +1719,32 @@ export class Engine {
         ? `BIOME: ${BIOME_NAMES[biome]}  !! -${ACID_DAMAGE} HP/s`
         : `BIOME: ${BIOME_NAMES[biome] ?? 'UNKNOWN'}`;
     r.drawRawText(1, 6, biomeText, BIOME_UI_COLORS[biome] ?? '#00ff9c');
+
+    const ramRatio = Math.max(0, Math.min(1, this.ram / RAM_MAX));
+    const ramFilled = Math.round(ramRatio * HP_BAR_WIDTH);
+    const ramColor = this.glitching ? '#ff2040' : '#33aaff';
+    r.drawRawText(1, 7, `RAM: ${Math.floor(this.ram)}/${RAM_MAX}`, ramColor);
+    r.drawRawText(HP_BAR_COL, 7, '[', '#2a7a5a');
+    r.drawRawText(HP_BAR_COL + 1, 7, '#'.repeat(ramFilled), ramColor);
+    r.drawRawText(HP_BAR_COL + 1 + ramFilled, 7, '-'.repeat(HP_BAR_WIDTH - ramFilled), '#1f3a30');
+    r.drawRawText(HP_BAR_COL + 1 + HP_BAR_WIDTH, 7, ']', '#2a7a5a');
+    if (this.glitching) {
+      r.drawRawText(HP_BAR_COL + HP_BAR_WIDTH + 3, 7, 'GLITCH', '#ff2040');
+    } else if (this.overclockTimer > 0) {
+      r.drawRawText(HP_BAR_COL + HP_BAR_WIDTH + 3, 7, `OC ${Math.ceil(this.overclockTimer)}s`, '#ffd028');
+    }
+
+    r.drawRawText(
+      1,
+      8,
+      `WPN: ${this.equippedWeapon?.name ?? '-'}  ARM: ${this.equippedArmor?.name ?? '-'}`,
+      '#00d4ff'
+    );
+
+    if (this.messageTimer > 0) {
+      r.drawRawText(1, 9, this.message, '#ffd028');
+    } else {
+      r.drawRawText(1, 9, `Q BOMB ${BOMB_COST}  E BLINK ${BLINK_COST}  R OVRCLK ${OVERCLOCK_COST}`, '#2a7a5a');
+    }
   }
 }

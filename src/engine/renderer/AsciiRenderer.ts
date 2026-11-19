@@ -1,13 +1,3 @@
-/**
- * AsciiRenderer — owns the <canvas>, a grid of character cells and the Z-buffer.
- *
- * Every frame:
- *   1. clear()    -> empties the cells, Z-buffer = Infinity, drops UI panels
- *   2. drawChar / drawLine / fillRect / drawRawText fill the cell buffers
- *   3. present()  -> paints background, panels, then characters (ctx.fillText)
- */
-
-/** CHANGED: a solid background rectangle in CELL coordinates. */
 interface Panel {
   x: number;
   y: number;
@@ -16,33 +6,27 @@ interface Panel {
   color: string;
 }
 
-/** CHANGED: per-pixel color lookup. Return null to skip the pixel (fully fogged). */
 export type ShadeFn = (z: number) => string | null;
 
 export class AsciiRenderer {
   public readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
 
-  // Font / cell metrics
   private readonly fontSize: number;
   public charW: number;
   public charH: number;
 
-  // Grid
   public cols: number;
   public rows: number;
   public offsetX: number;
   public offsetY: number;
 
-  // Per-cell buffers (index = y * cols + x)
   public zBuffer: Float32Array;
   private chars: string[];
   private colors: string[];
 
-  // CHANGED: solid panels queued for this frame
   private readonly panels: Panel[];
 
-  // CSS pixel size of the canvas
   private cssWidth: number;
   private cssHeight: number;
 
@@ -62,7 +46,7 @@ export class AsciiRenderer {
     this.zBuffer = new Float32Array(0);
     this.chars = [];
     this.colors = [];
-    this.panels = []; // CHANGED
+    this.panels = [];
     this.cssWidth = 0;
     this.cssHeight = 0;
 
@@ -80,7 +64,6 @@ export class AsciiRenderer {
     this.canvas.style.width = `${this.cssWidth}px`;
     this.canvas.style.height = `${this.cssHeight}px`;
 
-    // Setting canvas.width resets the context state -> re-apply everything.
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.ctx.font = `${this.fontSize}px "Courier New", monospace`;
     this.ctx.textBaseline = 'top';
@@ -100,19 +83,16 @@ export class AsciiRenderer {
     this.zBuffer.fill(Infinity);
   }
 
-  /** PHYSICAL aspect ratio of the ASCII grid (cells are taller than wide). */
   public getAspect(): number {
     return (this.cols * this.charW) / (this.rows * this.charH);
   }
 
-  /** Call at the start of every frame. */
   public clear(): void {
     this.zBuffer.fill(Infinity);
     this.chars.fill('');
-    this.panels.length = 0; // CHANGED
+    this.panels.length = 0;
   }
 
-  /** Depth-tested write of one character. Draws ONLY if z < buffer. (unchanged) */
   public drawChar(x: number, y: number, char: string, color: string, z: number): void {
     const px = Math.floor(x);
     const py = Math.floor(y);
@@ -127,13 +107,6 @@ export class AsciiRenderer {
     }
   }
 
-  /**
-   * Bresenham line with perspective-correct depth.
-   *
-   * CHANGED: optional `shade` callback. When given, the color of EACH pixel is
-   * shade(z) using that pixel's own interpolated depth (this is what makes the
-   * distance fog smooth along a long line). Returning null skips the pixel.
-   */
   public drawLine(
     x0: number,
     y0: number,
@@ -186,15 +159,6 @@ export class AsciiRenderer {
     }
   }
 
-  /**
-   * CHANGED (new): solid background rectangle, in CELL units (x, y, w, h).
-   *
-   * Why it is buffered: present() repaints the whole canvas every frame, so an
-   * immediate ctx.fillRect would be erased. We queue the panel, wipe the cells
-   * under it, and lock their Z to -Infinity so nothing drawn later (e.g. grid
-   * lines) can show through. Pixel bounds are computed in present() from
-   * offsetX/offsetY/charW/charH, so the panel survives window resizes.
-   */
   public fillRect(x: number, y: number, w: number, h: number, color: string): void {
     const x0 = Math.max(0, Math.floor(x));
     const y0 = Math.max(0, Math.floor(y));
@@ -213,7 +177,6 @@ export class AsciiRenderer {
     }
   }
 
-  /** UI text. Always on top: ignores and overwrites the Z-buffer. (unchanged) */
   public drawRawText(col: number, row: number, text: string, color: string): void {
     if (row < 0 || row >= this.rows) return;
     for (let i = 0; i < text.length; i++) {
@@ -226,13 +189,31 @@ export class AsciiRenderer {
     }
   }
 
-  /** Paints the cell buffers onto the canvas. Call once per frame, after drawing. */
+  public glitchRows(count: number, maxShift: number): void {
+    for (let i = 0; i < count; i++) {
+      const row = Math.floor(Math.random() * this.rows);
+      const shift = Math.round((Math.random() * 2 - 1) * maxShift);
+      if (shift === 0) continue;
+      const base = row * this.cols;
+      const rowChars = this.chars.slice(base, base + this.cols);
+      const rowColors = this.colors.slice(base, base + this.cols);
+      for (let col = 0; col < this.cols; col++) {
+        const src = col - shift;
+        if (src < 0 || src >= this.cols) {
+          this.chars[base + col] = '';
+        } else {
+          this.chars[base + col] = rowChars[src] ?? '';
+          this.colors[base + col] = rowColors[src] ?? '#0f0';
+        }
+      }
+    }
+  }
+
   public present(): void {
     const ctx = this.ctx;
     ctx.fillStyle = '#000805';
     ctx.fillRect(0, 0, this.cssWidth, this.cssHeight);
 
-    // CHANGED: panels go AFTER the background and BEFORE the characters.
     for (const p of this.panels) {
       ctx.fillStyle = p.color;
       ctx.fillRect(

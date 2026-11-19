@@ -7,20 +7,24 @@ export class Input {
   public action: boolean = false;
   public actionJustPressed: boolean = false;
 
+  public spaceJustPressed: boolean = false;
   public inventoryJustPressed: boolean = false;
+  public saveJustPressed: boolean = false;
 
-  // Syntax Overload skills: one-frame edge flags (set on keydown, cleared by the Engine).
-  public qJustPressed: boolean = false; // Logic Bomb
-  public eJustPressed: boolean = false; // Data Blink
-  public rJustPressed: boolean = false; // Overclock
+  public qJustPressed: boolean = false;
+  public eJustPressed: boolean = false;
+  public rJustPressed: boolean = false;
 
   public mouseX: number = 0;
   public mouseY: number = 0;
 
   constructor() {
     window.addEventListener('keydown', (e) => {
+      if (e.code === 'Space') e.preventDefault();
       if (!e.repeat) {
         if (e.code === 'KeyI') this.inventoryJustPressed = true;
+        if (e.code === 'KeyP') this.saveJustPressed = true;
+        if (e.code === 'Space') this.spaceJustPressed = true;
         if (e.code === 'KeyQ') this.qJustPressed = true;
         if (e.code === 'KeyE') this.eJustPressed = true;
         if (e.code === 'KeyR') this.rJustPressed = true;
@@ -64,7 +68,9 @@ export class Input {
 
   public resetJustPressed(): void {
     this.actionJustPressed = false;
+    this.spaceJustPressed = false;
     this.inventoryJustPressed = false;
+    this.saveJustPressed = false;
     this.qJustPressed = false;
     this.eJustPressed = false;
     this.rJustPressed = false;
