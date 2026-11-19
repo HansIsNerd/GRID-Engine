@@ -26,18 +26,24 @@ interface Particle {
   gravity: number;
 }
 
-type ItemKind = 'weapon' | 'armor' | 'potion' | 'ram' | 'core' | 'misc';
+type ItemType = 'weapon' | 'armor' | 'consumable' | 'core';
 
-interface InventoryItem {
+interface ItemStats {
+  damage?: number;
+  hp?: number;
+  ram?: number;
+}
+
+interface Item {
   name: string;
   char: string;
   color: string;
   detail: string;
-  kind: ItemKind;
-  value: number;
+  type: ItemType;
+  stats: ItemStats;
 }
 
-type Item = InventoryItem;
+type InventoryItem = Item;
 
 interface Loot {
   pos: Vector3;
@@ -58,6 +64,10 @@ interface InventoryLayout {
   panelH: number;
   gridX: number;
   gridY: number;
+  equipX: number;
+  equipY: number;
+  equipW: number;
+  equipH: number;
 }
 
 interface Obstacle {
@@ -127,7 +137,7 @@ const CUBE_HALF = 0.5;
 const ATTACK_RANGE = 2.5;
 const BASE_ATTACK_DAMAGE = 10;
 const HIT_FLASH_TIME = 0.2;
-const PLAYER_MAX_HP = 100;
+const PLAYER_BASE_HP = 100;
 const NPC_MAX_HP = 100;
 const TARGET_UI_RANGE = 8;
 
@@ -195,7 +205,7 @@ const SHAKE_AMP = 0.3;
 const GLITCH_ROWS = 6;
 const GLITCH_SHIFT = 3;
 const MESSAGE_TIME = 2;
-const SAVE_KEY = 'grid_save_v1';
+const SAVE_KEY = 'grid_save_v2';
 const BOMB_COLORS: string[] = ['#33aaff', '#66ccff', '#ccf0ff'];
 const BLINK_COLORS: string[] = ['#b266ff', '#d199ff', '#ffffff'];
 const OVERCLOCK_COLORS: string[] = ['#ff9020', '#ffd028', '#ffffff'];
@@ -224,21 +234,25 @@ const SPARK_COLORS: string[] = ['#ffffff', '#ffee55', '#ffd028'];
 const BLOOD_COLORS: string[] = ['#ff0000', '#ff2020', '#ff5555'];
 const PICKUP_COLORS: string[] = ['#00ff9c', '#55ff88', '#aaffcc'];
 
+const ITEM_TYPES: string[] = ['weapon', 'armor', 'consumable', 'core'];
+
 const LOOT_POOL: Item[] = [
-  { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', kind: 'weapon', value: 12 },
-  { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', kind: 'potion', value: 40 },
-  { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', kind: 'ram', value: 25 },
-  { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50', kind: 'misc', value: 50 },
-  { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6', kind: 'armor', value: 6 },
+  { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', type: 'weapon', stats: { damage: 12 } },
+  { name: 'Plasma Blade', char: 'L', color: '#ff40d0', detail: 'ATK +20', type: 'weapon', stats: { damage: 20 } },
+  { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', type: 'consumable', stats: { hp: 40 } },
+  { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', type: 'consumable', stats: { ram: 25 } },
+  { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 50', type: 'consumable', stats: {} },
+  { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'MAX HP +30', type: 'armor', stats: { hp: 30 } },
+  { name: 'Nano Vest', char: 'V', color: '#00ffd0', detail: 'MAX HP +50', type: 'armor', stats: { hp: 50 } },
 ];
 
 const CYBER_CORE_TEMPLATE: Item = {
   name: CYBER_CORE_NAME,
   char: 'C',
   color: '#00ffff',
-  detail: 'Click: ATK +5',
-  kind: 'core',
-  value: CYBER_CORE_ATTACK_BONUS,
+  detail: 'Click: base ATK +5',
+  type: 'core',
+  stats: { damage: CYBER_CORE_ATTACK_BONUS },
 };
 
 const PLAYER_RGB: Rgb = { r: 40, g: 255, b: 170 };
@@ -253,6 +267,8 @@ const SLOT_GAP = 1;
 const PANEL_PAD_X = 3;
 const PANEL_PAD_TOP = 3;
 const PANEL_PAD_BOTTOM = 4;
+const PANEL_GAP = 2;
+const EQUIP_PANEL_W = 32;
 const DIM_FACTOR = 0.3;
 
 const HP_BAR_COL = 21;
@@ -265,16 +281,23 @@ const INV_BORDER_HOVER = '#ffffff';
 const INV_TITLE = '#00ff9c';
 const INV_INFO = '#00d4ff';
 
+function cloneItem(item: Item): Item {
+  return { ...item, stats: { ...item.stats } };
+}
+
 function isItem(v: unknown): v is Item {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Record<string, unknown>;
+  const stats = o['stats'];
   return (
     typeof o['name'] === 'string' &&
     typeof o['char'] === 'string' &&
     typeof o['color'] === 'string' &&
     typeof o['detail'] === 'string' &&
-    typeof o['kind'] === 'string' &&
-    typeof o['value'] === 'number'
+    typeof o['type'] === 'string' &&
+    ITEM_TYPES.includes(o['type']) &&
+    typeof stats === 'object' &&
+    stats !== null
   );
 }
 
@@ -352,7 +375,7 @@ export class Engine {
     this.input = new Input();
     this.playerPos = new Vector3(0, 0, 0);
     this.facing = 0;
-    this.playerHealth = PLAYER_MAX_HP;
+    this.playerHealth = PLAYER_BASE_HP;
 
     this.playerExp = 0;
     this.playerLevel = START_LEVEL;
@@ -389,12 +412,14 @@ export class Engine {
     this.isInventoryOpen = false;
     this.hoverSlot = -1;
     this.inventoryItems = new Array<InventoryItem | null>(INV_COLS * INV_ROWS).fill(null);
-    this.inventoryItems[0] = { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', kind: 'weapon', value: 12 };
-    this.inventoryItems[1] = { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', kind: 'potion', value: 40 };
-    this.inventoryItems[2] = { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 120', kind: 'misc', value: 120 };
-    this.inventoryItems[5] = { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', kind: 'ram', value: 25 };
-    this.inventoryItems[7] = { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'DEF +6', kind: 'armor', value: 6 };
-    this.inventoryItems[10] = { name: 'Ancient Key', char: 'k', color: '#b266ff', detail: 'Opens something', kind: 'misc', value: 0 };
+    this.inventoryItems[0] = { name: 'Iron Sword', char: 'S', color: '#e8e8e8', detail: 'ATK +12', type: 'weapon', stats: { damage: 12 } };
+    this.inventoryItems[1] = { name: 'Health Potion', char: 'P', color: '#ff3355', detail: 'Restores 40 HP', type: 'consumable', stats: { hp: 40 } };
+    this.inventoryItems[2] = { name: 'Gold Coins', char: '$', color: '#ffd028', detail: 'x 120', type: 'consumable', stats: {} };
+    this.inventoryItems[3] = { name: 'Plasma Blade', char: 'L', color: '#ff40d0', detail: 'ATK +20', type: 'weapon', stats: { damage: 20 } };
+    this.inventoryItems[5] = { name: 'Mana Potion', char: 'P', color: '#33aaff', detail: 'Restores 25 RAM', type: 'consumable', stats: { ram: 25 } };
+    this.inventoryItems[7] = { name: 'Oak Shield', char: 'O', color: '#c8863a', detail: 'MAX HP +30', type: 'armor', stats: { hp: 30 } };
+    this.inventoryItems[8] = { name: 'Nano Vest', char: 'V', color: '#00ffd0', detail: 'MAX HP +50', type: 'armor', stats: { hp: 50 } };
+    this.inventoryItems[10] = { name: 'Ancient Key', char: 'k', color: '#b266ff', detail: 'Opens something', type: 'consumable', stats: {} };
 
     this.pitch = CAMERA_PITCH;
     this.yaw = 0;
@@ -617,6 +642,15 @@ export class Engine {
     this.messageTimer = MESSAGE_TIME;
   }
 
+  private getMaxHP(): number {
+    return PLAYER_BASE_HP + (this.equippedArmor?.stats.hp ?? 0);
+  }
+
+  private getAttackDamage(): number {
+    const base = BASE_ATTACK_DAMAGE + this.coreBonus + (this.equippedWeapon?.stats.damage ?? 0);
+    return base * (this.overclockTimer > 0 ? OVERCLOCK_MULT : 1);
+  }
+
   private saveGame(): void {
     const data = {
       x: this.playerPos.x,
@@ -653,7 +687,6 @@ export class Engine {
 
       this.playerPos.x = Math.max(-GRID_HALF, Math.min(GRID_HALF, num('x', 0)));
       this.playerPos.z = Math.max(-GRID_HALF, Math.min(GRID_HALF, num('z', 0)));
-      this.playerHealth = Math.max(1, Math.min(PLAYER_MAX_HP, num('hp', PLAYER_MAX_HP)));
       this.ram = Math.max(0, Math.min(RAM_MAX, num('ram', RAM_MAX)));
       this.playerLevel = Math.max(1, Math.floor(num('level', START_LEVEL)));
       this.playerExp = Math.max(0, num('exp', 0));
@@ -668,9 +701,11 @@ export class Engine {
         }
       }
       const w = o['weapon'];
-      this.equippedWeapon = isItem(w) && w.kind === 'weapon' ? w : null;
+      this.equippedWeapon = isItem(w) && w.type === 'weapon' ? w : null;
       const a = o['armor'];
-      this.equippedArmor = isItem(a) && a.kind === 'armor' ? a : null;
+      this.equippedArmor = isItem(a) && a.type === 'armor' ? a : null;
+
+      this.playerHealth = Math.max(1, Math.min(this.getMaxHP(), num('hp', this.getMaxHP())));
     } catch {
       return;
     }
@@ -718,11 +753,6 @@ export class Engine {
     const dx = this.npcPos.x - this.playerPos.x;
     const dz = this.npcPos.z - this.playerPos.z;
     return Math.sqrt(dx * dx + dz * dz);
-  }
-
-  private currentAttack(): number {
-    const base = BASE_ATTACK_DAMAGE + this.coreBonus + (this.equippedWeapon?.value ?? 0);
-    return base * (this.overclockTimer > 0 ? OVERCLOCK_MULT : 1);
   }
 
   private damageNpc(amount: number, colors: string[]): void {
@@ -820,7 +850,7 @@ export class Engine {
     if (!template) return;
     this.lootItems.push({
       pos: new Vector3(pos.x, 0, pos.z),
-      item: { ...template },
+      item: cloneItem(template),
       age: 0,
     });
   }
@@ -857,13 +887,13 @@ export class Engine {
   private grantCyberCore(): void {
     const slot = this.firstEmptySlot();
     if (slot >= 0) {
-      this.inventoryItems[slot] = { ...CYBER_CORE_TEMPLATE };
+      this.inventoryItems[slot] = cloneItem(CYBER_CORE_TEMPLATE);
       return;
     }
     if (this.lootItems.length >= MAX_LOOT) return;
     this.lootItems.push({
       pos: new Vector3(this.playerPos.x, 0, this.playerPos.z),
-      item: { ...CYBER_CORE_TEMPLATE },
+      item: cloneItem(CYBER_CORE_TEMPLATE),
       age: 0,
     });
   }
@@ -1066,8 +1096,7 @@ export class Engine {
     this.npcFacing += diff * (1 - Math.exp(-10 * dt));
 
     if (this.distanceToNpc() < NPC_ATTACK_RANGE && this.npcAttackCooldown <= 0) {
-      const dmg = Math.max(1, NPC_ATTACK_DAMAGE - (this.equippedArmor?.value ?? 0));
-      this.playerHealth = Math.max(0, this.playerHealth - dmg);
+      this.playerHealth = Math.max(0, this.playerHealth - NPC_ATTACK_DAMAGE);
       this.npcAttackCooldown = NPC_ATTACK_COOLDOWN;
       this.spawnHitEffect(this.playerPos, BLOOD_COLORS);
     }
@@ -1087,7 +1116,7 @@ export class Engine {
   }
 
   private respawn(): void {
-    this.playerHealth = PLAYER_MAX_HP;
+    this.playerHealth = this.getMaxHP();
     this.ram = RAM_MAX;
     this.overclockTimer = 0;
     this.playerPos.x = 0;
@@ -1116,19 +1145,48 @@ export class Engine {
 
   private getInventoryLayout(): InventoryLayout {
     const r = this.renderer;
+
+    // Grid size in character cells: N slots plus (N - 1) gaps between them.
     const gridW = INV_COLS * SLOT_W + (INV_COLS - 1) * SLOT_GAP;
     const gridH = INV_ROWS * SLOT_H + (INV_ROWS - 1) * SLOT_GAP;
+
+    // Inventory panel = grid + padding on every side.
     const panelW = gridW + PANEL_PAD_X * 2;
     const panelH = gridH + PANEL_PAD_TOP + PANEL_PAD_BOTTOM;
-    const panelX = Math.floor((r.cols - panelW) / 2);
-    const panelY = Math.floor((r.rows - panelH) / 2);
+
+    // Both panels are centered together as ONE block:
+    //   [ inventory panel ][ gap ][ equipment panel ]
+    // so the block's total width is the sum of its parts.
+    const equipW = EQUIP_PANEL_W;
+    const equipH = panelH;
+    const totalW = panelW + PANEL_GAP + equipW;
+
+    // Center the block: (screen width - block width) / 2, floored to a whole cell.
+    // Math.max(0, ...) stops the block from sliding off-screen on tiny windows.
+    // Because the block is centered, the inventory grid is automatically
+    // "shifted left" of screen center by (gap + equipW) / 2 cells.
+    const blockX = Math.max(0, Math.floor((r.cols - totalW) / 2));
+    const panelY = Math.max(0, Math.floor((r.rows - panelH) / 2));
+
+    // Inventory panel sits at the left edge of the block.
+    const panelX = blockX;
+
+    // Equipment panel starts right after the inventory panel plus the gap.
+    // Both panels share panelY and panelH so their tops and bottoms align.
+    const equipX = panelX + panelW + PANEL_GAP;
+
     return {
       panelX,
       panelY,
       panelW,
       panelH,
+      // First slot's top-left corner: panel origin + inner padding.
       gridX: panelX + PANEL_PAD_X,
       gridY: panelY + PANEL_PAD_TOP,
+      equipX,
+      equipY: panelY,
+      equipW,
+      equipH,
     };
   }
 
@@ -1159,23 +1217,43 @@ export class Engine {
     const item = this.inventoryItems[slot];
     if (!item) return;
 
-    if (item.kind === 'weapon') {
-      this.inventoryItems[slot] = this.equippedWeapon;
+    if (item.type === 'weapon') {
+      // SWAP: the clicked item goes into the weapon slot, and whatever was
+      // equipped (an Item or null) moves into the exact inventory slot that
+      // was clicked. Holding the old value in `previous` first prevents
+      // overwriting it. If nothing was equipped, `previous` is null, so the
+      // slot empties and the net effect is a plain equip. No item is ever
+      // duplicated or lost.
+      const previous = this.equippedWeapon;
+      this.inventoryItems[slot] = previous;
       this.equippedWeapon = item;
-    } else if (item.kind === 'armor') {
-      this.inventoryItems[slot] = this.equippedArmor;
+      this.showMessage(`EQUIPPED ${item.name}`);
+    } else if (item.type === 'armor') {
+      // Same swap as the weapon, using the armor slot. Armor changes MAX HP,
+      // so current HP is clamped afterwards: swapping to weaker armor can
+      // never leave HP above the new maximum.
+      const previous = this.equippedArmor;
+      this.inventoryItems[slot] = previous;
       this.equippedArmor = item;
-    } else if (item.kind === 'potion') {
-      this.playerHealth = Math.min(PLAYER_MAX_HP, this.playerHealth + item.value);
-      this.inventoryItems[slot] = null;
-    } else if (item.kind === 'ram') {
-      this.ram = Math.min(RAM_MAX, this.ram + item.value);
-      this.inventoryItems[slot] = null;
-    } else if (item.kind === 'core') {
-      this.coreBonus += item.value;
+      this.playerHealth = Math.min(this.playerHealth, this.getMaxHP());
+      this.showMessage(`EQUIPPED ${item.name}`);
+    } else if (item.type === 'core') {
+      // Cores are consumed (slot becomes null) for a permanent base damage bonus.
+      this.coreBonus += item.stats.damage ?? 0;
       this.inventoryItems[slot] = null;
       this.isInventoryOpen = false;
       this.hoverSlot = -1;
+    } else {
+      let used = false;
+      if (item.stats.hp !== undefined) {
+        this.playerHealth = Math.min(this.getMaxHP(), this.playerHealth + item.stats.hp);
+        used = true;
+      }
+      if (item.stats.ram !== undefined) {
+        this.ram = Math.min(RAM_MAX, this.ram + item.stats.ram);
+        used = true;
+      }
+      if (used) this.inventoryItems[slot] = null;
     }
   }
 
@@ -1243,7 +1321,7 @@ export class Engine {
     }
 
     if ((click || space) && this.npcAlive() && this.distanceToNpc() < ATTACK_RANGE) {
-      this.damageNpc(this.currentAttack(), SPARK_COLORS);
+      this.damageNpc(this.getAttackDamage(), SPARK_COLORS);
     }
 
     if (this.npcHitTimer > 0) this.npcHitTimer = Math.max(0, this.npcHitTimer - dt);
@@ -1613,6 +1691,63 @@ export class Engine {
     }
   }
 
+  private drawEquipSlot(x: number, y: number, label: string, item: Item | null, statText: string): void {
+    const r = this.renderer;
+    const horizontal = '+' + '-'.repeat(SLOT_W - 2) + '+';
+    const middle = '|' + ' '.repeat(SLOT_W - 2) + '|';
+
+    // Slot block layout (rows relative to y):
+    //   y      : label ("WEAPON" / "ARMOR")
+    //   y+1..  : SLOT_H-row bordered box, same size as an inventory slot
+    //   box center row (y + 1 + floor(SLOT_H / 2)) : item glyph inside the box,
+    //   with name / stat text to the right of the box.
+    r.drawRawText(x, y, label, INV_TITLE);
+
+    const boxY = y + 1;
+    r.drawRawText(x, boxY, horizontal, INV_BORDER);
+    for (let row = 1; row < SLOT_H - 1; row++) {
+      r.drawRawText(x, boxY + row, middle, INV_BORDER);
+    }
+    r.drawRawText(x, boxY + SLOT_H - 1, horizontal, INV_BORDER);
+
+    const centerRow = boxY + Math.floor(SLOT_H / 2);
+    if (item) {
+      r.drawRawText(x + Math.floor(SLOT_W / 2), centerRow, item.char, item.color);
+      r.drawRawText(x + SLOT_W + 2, centerRow - 1, item.name.slice(0, EQUIP_PANEL_W - SLOT_W - 6), item.color);
+      r.drawRawText(x + SLOT_W + 2, centerRow, statText, INV_INFO);
+    } else {
+      r.drawRawText(x + SLOT_W + 2, centerRow, '(empty)', INV_BORDER);
+    }
+  }
+
+  private drawEquipmentPanel(layout: InventoryLayout): void {
+    const r = this.renderer;
+    r.fillRect(layout.equipX, layout.equipY, layout.equipW, layout.equipH, INV_PANEL_BG);
+
+    // Title centered inside the equipment panel using the same formula as the
+    // inventory title: panel left + floor((panel width - text length) / 2).
+    const title = '[ EQUIPMENT ]';
+    r.drawRawText(
+      layout.equipX + Math.floor((layout.equipW - title.length) / 2),
+      layout.equipY + 1,
+      title,
+      INV_TITLE
+    );
+
+    // Slot content is inset by 2 cells from the panel's left edge. Vertical
+    // stack (rows relative to equipY): weapon block at +3 (label + 5-row box
+    // = 6 rows), armor block at +10 (one blank row between), totals at +17.
+    const slotX = layout.equipX + 2;
+    const weapon = this.equippedWeapon;
+    const armor = this.equippedArmor;
+    this.drawEquipSlot(slotX, layout.equipY + 3, 'WEAPON', weapon, `ATK +${weapon?.stats.damage ?? 0}`);
+    this.drawEquipSlot(slotX, layout.equipY + 10, 'ARMOR', armor, `HP +${armor?.stats.hp ?? 0}`);
+
+    r.drawRawText(slotX, layout.equipY + 17, 'TOTAL STATS', INV_TITLE);
+    r.drawRawText(slotX, layout.equipY + 18, `ATK:    ${this.getAttackDamage()}`, '#ffd028');
+    r.drawRawText(slotX, layout.equipY + 19, `MAX HP: ${this.getMaxHP()}`, '#00ff9c');
+  }
+
   private drawInventory(): void {
     const r = this.renderer;
     const layout = this.getInventoryLayout();
@@ -1668,10 +1803,13 @@ export class Engine {
 
     const hint = 'CLICK: USE/EQUIP  CLOSE: I';
     r.drawRawText(layout.panelX + Math.floor((layout.panelW - hint.length) / 2), infoY, hint, INV_INFO);
+
+    this.drawEquipmentPanel(layout);
   }
 
   private drawUI(): void {
     const r = this.renderer;
+    const maxHp = this.getMaxHP();
 
     r.fillRect(0, 0, 50, 10, '#000000');
 
@@ -1683,10 +1821,10 @@ export class Engine {
       '#00d4ff'
     );
 
-    const ratio = Math.max(0, Math.min(1, this.playerHealth / PLAYER_MAX_HP));
+    const ratio = Math.max(0, Math.min(1, this.playerHealth / maxHp));
     const filled = Math.round(ratio * HP_BAR_WIDTH);
     const hpColor = ratio > 0.5 ? '#00ff9c' : ratio > 0.25 ? '#ffd028' : '#ff2020';
-    r.drawRawText(1, 2, `PLAYER HP: ${this.playerHealth}/${PLAYER_MAX_HP}`, hpColor);
+    r.drawRawText(1, 2, `PLAYER HP: ${this.playerHealth}/${maxHp}`, hpColor);
     r.drawRawText(HP_BAR_COL, 2, '[', '#2a7a5a');
     r.drawRawText(HP_BAR_COL + 1, 2, '#'.repeat(filled), hpColor);
     r.drawRawText(HP_BAR_COL + 1 + filled, 2, '-'.repeat(HP_BAR_WIDTH - filled), '#1f3a30');
@@ -1710,7 +1848,7 @@ export class Engine {
     r.drawRawText(
       1,
       5,
-      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.currentAttack()}`,
+      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.getAttackDamage()}`,
       '#00ffff'
     );
 
