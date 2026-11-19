@@ -1478,11 +1478,11 @@ export class Engine {
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
-    this.drawUI();
     if (this.isInventoryOpen) this.drawInventory();
     if (this.isSettingsOpen) this.drawSettings();
 
     r.present();
+    this.drawUI();
   }
 
   private drawPulseRing(viewProj: Matrix4, radius: number, fade: number, char: string): void {
@@ -1954,82 +1954,51 @@ export class Engine {
   }
 
   private drawUI(): void {
-    const r = this.renderer;
     const maxHp = this.getMaxHP();
-
-    r.fillRect(0, 0, 50, 10, '#000000');
-
-    r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
-    r.drawRawText(
-      1,
-      1,
-      `POS: X ${this.playerPos.x.toFixed(1)}  Z ${this.playerPos.z.toFixed(1)}`,
-      '#00d4ff'
-    );
-
-    const ratio = Math.max(0, Math.min(1, this.playerHealth / maxHp));
-    const filled = Math.round(ratio * HP_BAR_WIDTH);
-    const hpColor = ratio > 0.5 ? '#00ff9c' : ratio > 0.25 ? '#ffd028' : '#ff2020';
-    r.drawRawText(1, 2, `PLAYER HP: ${this.playerHealth}/${maxHp}`, hpColor);
-    r.drawRawText(HP_BAR_COL, 2, '[', '#2a7a5a');
-    r.drawRawText(HP_BAR_COL + 1, 2, '#'.repeat(filled), hpColor);
-    r.drawRawText(HP_BAR_COL + 1 + filled, 2, '-'.repeat(HP_BAR_WIDTH - filled), '#1f3a30');
-    r.drawRawText(HP_BAR_COL + 1 + HP_BAR_WIDTH, 2, ']', '#2a7a5a');
-
-    if (this.npcAlive()) {
-      if (this.distanceToNpc() < TARGET_UI_RANGE) {
-        r.drawRawText(1, 3, `ENEMY HP:  ${this.npcHealth}/${this.npcMaxHp}`, '#ff2fa0');
-      }
-    } else {
-      r.drawRawText(1, 3, `ENEMY DEFEATED  RESPAWN: ${Math.max(0, Math.ceil(this.npcRespawnTimer))}s`, '#2a7a5a');
-    }
-
-    const hud = this.isSettingsOpen
-      ? 'PAUSED  CONFIG: O'
-      : this.isInventoryOpen
-        ? 'PAUSED  INVENTORY: I'
-        : 'WASD LMB/SPC Q/E/R I:INV O:CFG P:SAVE';
-    r.drawRawText(1, 4, hud, '#2a7a5a');
-
-    r.drawRawText(
-      1,
-      5,
-      `LV ${this.playerLevel}  EXP ${this.playerExp}/${this.expToNextLevel}  ATK ${this.getAttackDamage()}`,
-      '#00ffff'
-    );
-
-    const biome = this.biomeAtPos(this.playerPos.x, this.playerPos.z);
-    const biomeText =
-      biome === BIOME_ACID
-        ? `BIOME: ${BIOME_NAMES[biome]}  !! -${ACID_DAMAGE} HP/s`
-        : `BIOME: ${BIOME_NAMES[biome] ?? 'UNKNOWN'}`;
-    r.drawRawText(1, 6, biomeText, BIOME_UI_COLORS[biome] ?? '#00ff9c');
+    const hpRatio = Math.max(0, Math.min(1, this.playerHealth / maxHp));
+    const hpFilled = Math.round(hpRatio * HP_BAR_WIDTH);
+    const hpColor = hpRatio > 0.5 ? '#00ff9c' : hpRatio > 0.25 ? '#ffd028' : '#ff2020';
+    const hpBar = `[${'#'.repeat(hpFilled)}${'-'.repeat(HP_BAR_WIDTH - hpFilled)}]`;
 
     const ramRatio = Math.max(0, Math.min(1, this.ram / RAM_MAX));
     const ramFilled = Math.round(ramRatio * HP_BAR_WIDTH);
     const ramColor = this.glitching ? '#ff2040' : '#33aaff';
-    r.drawRawText(1, 7, `RAM: ${Math.floor(this.ram)}/${RAM_MAX}`, ramColor);
-    r.drawRawText(HP_BAR_COL, 7, '[', '#2a7a5a');
-    r.drawRawText(HP_BAR_COL + 1, 7, '#'.repeat(ramFilled), ramColor);
-    r.drawRawText(HP_BAR_COL + 1 + ramFilled, 7, '-'.repeat(HP_BAR_WIDTH - ramFilled), '#1f3a30');
-    r.drawRawText(HP_BAR_COL + 1 + HP_BAR_WIDTH, 7, ']', '#2a7a5a');
-    if (this.glitching) {
-      r.drawRawText(HP_BAR_COL + HP_BAR_WIDTH + 3, 7, 'GLITCH', '#ff2040');
-    } else if (this.overclockTimer > 0) {
-      r.drawRawText(HP_BAR_COL + HP_BAR_WIDTH + 3, 7, `OC ${Math.ceil(this.overclockTimer)}s`, '#ffd028');
-    }
+    const ramBar = `[${'#'.repeat(ramFilled)}${'-'.repeat(HP_BAR_WIDTH - ramFilled)}]`;
 
-    r.drawRawText(
-      1,
-      8,
-      `WPN: ${this.equippedWeapon?.name ?? '-'}  ARM: ${this.equippedArmor?.name ?? '-'}`,
-      '#00d4ff'
-    );
+    const biome = this.biomeAtPos(this.playerPos.x, this.playerPos.z);
+    const biomeText = biome === BIOME_ACID
+      ? `BIOME: ${BIOME_NAMES[biome]}  !! -${ACID_DAMAGE} HP/s`
+      : `BIOME: ${BIOME_NAMES[biome] ?? 'UNKNOWN'}`;
 
-    if (this.messageTimer > 0) {
-      r.drawRawText(1, 9, this.message, '#ffd028');
-    } else {
-      r.drawRawText(1, 9, `Q BOMB ${BOMB_COST}  E BLINK ${BLINK_COST}  R OVRCLK ${OVERCLOCK_COST}`, '#2a7a5a');
-    }
+    const enemyText = this.npcAlive()
+      ? (this.distanceToNpc() < TARGET_UI_RANGE ? `ENEMY HP: ${this.npcHealth}/${this.npcMaxHp}` : '')
+      : `ENEMY DEFEATED  RESPAWN: ${Math.max(0, Math.ceil(this.npcRespawnTimer))}s`;
+
+    const controls = this.isSettingsOpen
+      ? 'PAUSED  CONFIG: O'
+      : this.isInventoryOpen
+        ? 'PAUSED  INVENTORY: I'
+        : 'WASD MOVE  LMB/SPC ATTACK  Q/E/R SKILLS  I INV  O CFG  P SAVE';
+
+    const abilityStatus = this.glitching
+      ? 'GLITCH ACTIVE'
+      : this.overclockTimer > 0
+        ? `OVERCLOCK: ${Math.ceil(this.overclockTimer)}s`
+        : 'SYSTEM: NORMAL';
+
+    const lines = [
+      { text: `FPS: ${Math.round(this.fps)}   //   AETHERGRID STATUS`, color: '#00ff9c' },
+      { text: `POS: X ${this.playerPos.x.toFixed(1)}   Z ${this.playerPos.z.toFixed(1)}`, color: '#00d4ff' },
+      { text: `PLAYER HP: ${this.playerHealth}/${maxHp}  ${hpBar}`, color: hpColor },
+      { text: enemyText, color: '#ff2fa0' },
+      { text: controls, color: '#65a88b' },
+      { text: `LV ${this.playerLevel}   EXP ${this.playerExp}/${this.expToNextLevel}   ATK ${this.getAttackDamage()}`, color: '#00ffff' },
+      { text: biomeText, color: BIOME_UI_COLORS[biome] ?? '#00ff9c' },
+      { text: `RAM: ${Math.floor(this.ram)}/${RAM_MAX}  ${ramBar}   ${abilityStatus}`, color: ramColor },
+      { text: `WPN: ${this.equippedWeapon?.name ?? '-'}   ARM: ${this.equippedArmor?.name ?? '-'}`, color: '#00d4ff' },
+      { text: this.messageTimer > 0 ? this.message : `Q BOMB ${BOMB_COST}   E BLINK ${BLINK_COST}   R OVRCLK ${OVERCLOCK_COST}`, color: this.messageTimer > 0 ? '#ffd028' : '#65a88b' },
+    ];
+
+    this.renderer.drawHudOverlay(lines);
   }
 }
