@@ -1,12 +1,8 @@
-interface Panel {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  color: string;
-}
-
 export type ShadeFn = (z: number) => string | null;
+
+const BG = '#000805';
+const UI_MIN_LUMA = 140;
+const STALE = '\u0001';
 
 export class AsciiRenderer {
   public readonly canvas: HTMLCanvasElement;
@@ -24,13 +20,28 @@ export class AsciiRenderer {
   public zBuffer: Float32Array;
   private chars: string[];
   private colors: string[];
+  private bgs: string[];
+  private bold: Uint8Array;
 
-  private readonly panels: Panel[];
+  private prevChars: string[];
+  private prevColors: string[];
+  private prevBgs: string[];
+  private prevBold: Uint8Array;
+  private dirty: Int32Array;
 
-  private cssWidth: number;
-  private cssHeight: number;
+  private dpr: number;
+  private dcw: number;
+  private dch: number;
+  private dox: number;
+  private doy: number;
+  private devW: number;
+  private devH: number;
+  private fontNormal: string;
+  private fontBold: string;
 
-  constructor(canvas: HTMLCanvasElement, fontSize: number = 10) {
+  private readonly liftCache: Map<string, string>;
+
+  constructor(canvas: HTMLCanvasElement, fontSize: number = 7) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('2D canvas context not available');
@@ -46,9 +57,23 @@ export class AsciiRenderer {
     this.zBuffer = new Float32Array(0);
     this.chars = [];
     this.colors = [];
-    this.panels = [];
-    this.cssWidth = 0;
-    this.cssHeight = 0;
+    this.bgs = [];
+    this.bold = new Uint8Array(0);
+    this.prevChars = [];
+    this.prevColors = [];
+    this.prevBgs = [];
+    this.prevBold = new Uint8Array(0);
+    this.dirty = new Int32Array(0);
+    this.dpr = 1;
+    this.dcw = fontSize * 0.6;
+    this.dch = Math.ceil(fontSize * 1.2);
+    this.dox = 0;
+    this.doy = 0;
+    this.devW = 0;
+    this.devH = 0;
+    this.fontNormal = '';
+    this.fontBold = '';
+    this.liftCache = new Map<string, string>();
 
     this.resize();
     window.addEventListener('resize', () => this.resize());
@@ -56,31 +81,54 @@ export class AsciiRenderer {
 
   public resize(): void {
     const dpr = window.devicePixelRatio || 1;
-    this.cssWidth = window.innerWidth;
-    this.cssHeight = window.innerHeight;
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    this.dpr = dpr;
+    this.devW = Math.floor(cssW * dpr);
+    this.devH = Math.floor(cssH * dpr);
 
-    this.canvas.width = Math.floor(this.cssWidth * dpr);
-    this.canvas.height = Math.floor(this.cssHeight * dpr);
-    this.canvas.style.width = `${this.cssWidth}px`;
-    this.canvas.style.height = `${this.cssHeight}px`;
+    this.canvas.width = this.devW;
+    this.canvas.height = this.devH;
+    this.canvas.style.width = `${cssW}px`;
+    this.canvas.style.height = `${cssH}px`;
 
-    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    this.ctx.font = `${this.fontSize}px "Courier New", monospace`;
-    this.ctx.textBaseline = 'top';
+    const fs = this.fontSize * dpr;
+    this.fontNormal = `${fs}px "Courier New", monospace`;
+    this.fontBold = `bold ${fs}px "Courier New", monospace`;
 
-    this.charW = this.ctx.measureText('M').width || this.fontSize * 0.6;
-    this.charH = Math.ceil(this.fontSize * 1.2);
+    const ctx = this.ctx;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.font = this.fontNormal;
+    ctx.textBaseline = 'top';
 
-    this.cols = Math.max(1, Math.floor(this.cssWidth / this.charW));
-    this.rows = Math.max(1, Math.floor(this.cssHeight / this.charH));
-    this.offsetX = (this.cssWidth - this.cols * this.charW) / 2;
-    this.offsetY = (this.cssHeight - this.rows * this.charH) / 2;
+    this.dcw = fs * 0.6;
+    this.dch = Math.ceil(fs * 1.2);
+    this.charW = this.dcw / dpr;
+    this.charH = this.dch / dpr;
+
+    this.cols = Math.max(1, Math.floor(this.devW / this.dcw));
+    this.rows = Math.max(1, Math.floor(this.devH / this.dch));
+    this.dox = Math.round((this.devW - this.cols * this.dcw) / 2);
+    this.doy = Math.round((this.devH - this.rows * this.dch) / 2);
+    this.offsetX = this.dox / dpr;
+    this.offsetY = this.doy / dpr;
 
     const size = this.cols * this.rows;
     this.zBuffer = new Float32Array(size);
+    this.zBuffer.fill(Infinity);
     this.chars = new Array<string>(size).fill('');
     this.colors = new Array<string>(size).fill('#0f0');
-    this.zBuffer.fill(Infinity);
+    this.bgs = new Array<string>(size).fill('');
+    this.bold = new Uint8Array(size);
+    this.prevChars = new Array<string>(size).fill(STALE);
+    this.prevColors = new Array<string>(size).fill('');
+    this.prevBgs = new Array<string>(size).fill(STALE);
+    this.prevBold = new Uint8Array(size);
+    this.dirty = new Int32Array(size);
+
+    ctx.fillStyle = BG;
+    ctx.fillRect(0, 0, this.devW, this.devH);
   }
 
   public getAspect(): number {
@@ -90,7 +138,8 @@ export class AsciiRenderer {
   public clear(): void {
     this.zBuffer.fill(Infinity);
     this.chars.fill('');
-    this.panels.length = 0;
+    this.bgs.fill('');
+    this.bold.fill(0);
   }
 
   public drawChar(x: number, y: number, char: string, color: string, z: number): void {
@@ -166,26 +215,48 @@ export class AsciiRenderer {
     const y1 = Math.min(this.rows, Math.ceil(y + h));
     if (x1 <= x0 || y1 <= y0) return;
 
-    this.panels.push({ x: x0, y: y0, w: x1 - x0, h: y1 - y0, color });
-
     for (let row = y0; row < y1; row++) {
       const base = row * this.cols;
       for (let col = x0; col < x1; col++) {
         this.chars[base + col] = '';
+        this.bgs[base + col] = color;
+        this.bold[base + col] = 0;
         this.zBuffer[base + col] = -Infinity;
       }
     }
   }
 
+  private lift(color: string): string {
+    const cached = this.liftCache.get(color);
+    if (cached !== undefined) return cached;
+    let out = color;
+    if (color.length === 7 && color.charAt(0) === '#') {
+      const r = parseInt(color.slice(1, 3), 16);
+      const g = parseInt(color.slice(3, 5), 16);
+      const b = parseInt(color.slice(5, 7), 16);
+      if (!Number.isNaN(r) && !Number.isNaN(g) && !Number.isNaN(b)) {
+        const m = Math.max(r, g, b);
+        if (m > 0 && m < UI_MIN_LUMA) {
+          const k = UI_MIN_LUMA / m;
+          out = `rgb(${Math.min(255, Math.round(r * k))},${Math.min(255, Math.round(g * k))},${Math.min(255, Math.round(b * k))})`;
+        }
+      }
+    }
+    this.liftCache.set(color, out);
+    return out;
+  }
+
   public drawRawText(col: number, row: number, text: string, color: string): void {
     if (row < 0 || row >= this.rows) return;
+    const c = this.lift(color);
     for (let i = 0; i < text.length; i++) {
       const cx = col + i;
       if (cx < 0 || cx >= this.cols) continue;
       const index = row * this.cols + cx;
       this.zBuffer[index] = -Infinity;
       this.chars[index] = text.charAt(i);
-      this.colors[index] = color;
+      this.colors[index] = c;
+      this.bold[index] = 1;
     }
   }
 
@@ -197,13 +268,16 @@ export class AsciiRenderer {
       const base = row * this.cols;
       const rowChars = this.chars.slice(base, base + this.cols);
       const rowColors = this.colors.slice(base, base + this.cols);
+      const rowBold = this.bold.slice(base, base + this.cols);
       for (let col = 0; col < this.cols; col++) {
         const src = col - shift;
         if (src < 0 || src >= this.cols) {
           this.chars[base + col] = '';
+          this.bold[base + col] = 0;
         } else {
           this.chars[base + col] = rowChars[src] ?? '';
           this.colors[base + col] = rowColors[src] ?? '#0f0';
+          this.bold[base + col] = rowBold[src] ?? 0;
         }
       }
     }
@@ -211,34 +285,74 @@ export class AsciiRenderer {
 
   public present(): void {
     const ctx = this.ctx;
-    ctx.fillStyle = '#000805';
-    ctx.fillRect(0, 0, this.cssWidth, this.cssHeight);
+    const cols = this.cols;
+    const n = cols * this.rows;
+    const dirty = this.dirty;
+    let dc = 0;
 
-    for (const p of this.panels) {
-      ctx.fillStyle = p.color;
-      ctx.fillRect(
-        this.offsetX + p.x * this.charW,
-        this.offsetY + p.y * this.charH,
-        p.w * this.charW,
-        p.h * this.charH
-      );
+    for (let i = 0; i < n; i++) {
+      let ch = this.chars[i] ?? '';
+      if (ch === ' ') ch = '';
+      const bg = this.bgs[i] ?? '';
+      const col = ch === '' ? '' : (this.colors[i] ?? '#0f0');
+      const b = ch === '' ? 0 : (this.bold[i] ?? 0);
+      if (
+        ch === this.prevChars[i] &&
+        col === this.prevColors[i] &&
+        bg === this.prevBgs[i] &&
+        b === this.prevBold[i]
+      ) {
+        continue;
+      }
+      this.prevChars[i] = ch;
+      this.prevColors[i] = col;
+      this.prevBgs[i] = bg;
+      this.prevBold[i] = b;
+      dirty[dc++] = i;
     }
 
-    let lastColor = '';
-    for (let row = 0; row < this.rows; row++) {
-      const base = row * this.cols;
-      const py = this.offsetY + row * this.charH;
-      for (let col = 0; col < this.cols; col++) {
-        const ch = this.chars[base + col];
-        if (!ch || ch === ' ') continue;
+    if (dc === 0) return;
 
-        const color = this.colors[base + col] ?? '#0f0';
-        if (color !== lastColor) {
-          ctx.fillStyle = color;
-          lastColor = color;
-        }
-        ctx.fillText(ch, this.offsetX + col * this.charW, py);
+    const dcw = this.dcw;
+    const dch = this.dch;
+    const dox = this.dox;
+    const doy = this.doy;
+
+    let fill = '';
+    for (let k = 0; k < dc; k++) {
+      const idx = dirty[k] ?? 0;
+      const col = idx % cols;
+      const row = (idx - col) / cols;
+      const x0 = Math.round(dox + col * dcw);
+      const x1 = Math.round(dox + (col + 1) * dcw);
+      const y0 = Math.round(doy + row * dch);
+      const bg = this.prevBgs[idx] || BG;
+      if (bg !== fill) {
+        ctx.fillStyle = bg;
+        fill = bg;
       }
+      ctx.fillRect(x0, y0, x1 - x0, dch);
+    }
+
+    let textColor = '';
+    let fb = -1;
+    for (let k = 0; k < dc; k++) {
+      const idx = dirty[k] ?? 0;
+      const ch = this.prevChars[idx] ?? '';
+      if (ch === '') continue;
+      const col = idx % cols;
+      const row = (idx - col) / cols;
+      const b = this.prevBold[idx] ?? 0;
+      if (b !== fb) {
+        ctx.font = b === 1 ? this.fontBold : this.fontNormal;
+        fb = b;
+      }
+      const color = this.prevColors[idx] ?? '#0f0';
+      if (color !== textColor) {
+        ctx.fillStyle = color;
+        textColor = color;
+      }
+      ctx.fillText(ch, Math.round(dox + col * dcw), Math.round(doy + row * dch));
     }
   }
 }

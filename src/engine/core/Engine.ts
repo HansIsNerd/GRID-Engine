@@ -72,15 +72,17 @@ interface Obstacle {
 }
 
 type NpcState = 'idle' | 'chase';
-
-const ASCII_RAMP = ' .:-=+*#%@';
+const ASCII_RAMP = ' .,:;irsXA253hMHGS#9B&@';
 
 const NEAR = 0.5;
 const FAR = 100;
 const FOV = Math.PI / 3;
 
-const GRID_HALF = 40;
+const GRID_HALF = 60;
 const GRID_SIZE = GRID_HALF * 2 + 1;
+const GRID_STEP = 2;
+const GRID_MAJOR = 10;
+const FONT_SIZE = 8.5;
 const MOVE_SPEED = 6;
 
 const CAMERA_PITCH = -Math.PI / 3;
@@ -346,9 +348,8 @@ export class Engine {
   private running: boolean;
 
   constructor(canvas: HTMLCanvasElement) {
-    this.renderer = new AsciiRenderer(canvas, 10);
+    this.renderer = new AsciiRenderer(canvas, FONT_SIZE);
     this.input = new Input();
-
     this.playerPos = new Vector3(0, 0, 0);
     this.facing = 0;
     this.playerHealth = PLAYER_MAX_HP;
@@ -1418,8 +1419,8 @@ export class Engine {
 
   private drawFloor(viewProj: Matrix4): void {
     const tick = Math.floor(this.time * GLITCH_FLICKER_RATE);
-    for (let i = -GRID_HALF; i <= GRID_HALF; i++) {
-      const major = i % 5 === 0;
+    for (let i = -GRID_HALF; i <= GRID_HALF; i += GRID_STEP) {
+      const major = i % GRID_MAJOR === 0;
       this.drawFloorLine(viewProj, true, i, major, tick);
       this.drawFloorLine(viewProj, false, i, major, tick);
     }
