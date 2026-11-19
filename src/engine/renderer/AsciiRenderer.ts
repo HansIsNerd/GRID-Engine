@@ -1,8 +1,31 @@
+import {
+  DEFAULT_RENDER_CONFIGURATION,
+  resolveGrid,
+  resolveQualityProfile,
+  resolveRenderProfile,
+  type QualityProfile,
+  type RenderConfiguration,
+  type RenderProfile,
+} from '../core/RenderConfig';
+
 export type ShadeFn = (z: number) => string | null;
 
 const BG = '#000805';
 const UI_MIN_LUMA = 140;
 const STALE = '\u0001';
+
+function sameProfile(a: RenderProfile, b: RenderProfile): boolean {
+  return (
+    a.devW === b.devW &&
+    a.devH === b.devH &&
+    a.displayW === b.displayW &&
+    a.displayH === b.displayH &&
+    a.left === b.left &&
+    a.top === b.top &&
+    a.pixelRatio === b.pixelRatio &&
+    a.densityFactor === b.densityFactor
+  );
+}
 
 export class AsciiRenderer {
   public readonly canvas: HTMLCanvasElement;
@@ -17,9 +40,6 @@ export class AsciiRenderer {
   public offsetX: number;
   public offsetY: number;
 
-  public drawnCells: number;
-  public dirtyCells: number;
-
   public zBuffer: Float32Array;
   private chars: string[];
   private colors: string[];
@@ -32,33 +52,42 @@ export class AsciiRenderer {
   private prevBold: Uint8Array;
   private dirty: Int32Array;
 
-  private dpr: number;
+  private config: RenderConfiguration;
+  private profile: RenderProfile;
+  public quality: QualityProfile;
+
+  private pixelRatio: number;
   private dcw: number;
   private dch: number;
   private dox: number;
   private doy: number;
-  private devW: number;
-  private devH: number;
+  public devW: number;
+  public devH: number;
   private fontNormal: string;
   private fontBold: string;
 
   private readonly liftCache: Map<string, string>;
 
-  constructor(canvas: HTMLCanvasElement, fontSize: number = 7) {
+  constructor(
+    canvas: HTMLCanvasElement,
+    fontSize: number = 7,
+    config: RenderConfiguration = DEFAULT_RENDER_CONFIGURATION
+  ) {
     this.canvas = canvas;
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('2D canvas context not available');
     this.ctx = ctx;
 
     this.fontSize = fontSize;
+    this.config = config;
+    this.quality = resolveQualityProfile(config.quality);
+    this.profile = resolveRenderProfile(config, window.innerWidth, window.innerHeight, window.devicePixelRatio || 1);
     this.charW = fontSize * 0.6;
     this.charH = Math.ceil(fontSize * 1.2);
     this.cols = 0;
     this.rows = 0;
     this.offsetX = 0;
     this.offsetY = 0;
-    this.drawnCells = 0;
-    this.dirtyCells = 0;
     this.zBuffer = new Float32Array(0);
     this.chars = [];
     this.colors = [];
@@ -69,7 +98,7 @@ export class AsciiRenderer {
     this.prevBgs = [];
     this.prevBold = new Uint8Array(0);
     this.dirty = new Int32Array(0);
-    this.dpr = 1;
+    this.pixelRatio = 1;
     this.dcw = fontSize * 0.6;
     this.dch = Math.ceil(fontSize * 1.2);
     this.dox = 0;
@@ -80,26 +109,45 @@ export class AsciiRenderer {
     this.fontBold = '';
     this.liftCache = new Map<string, string>();
 
-    this.resize();
+    this.applyProfile();
     window.addEventListener('resize', () => this.resize());
   }
 
+  public setConfig(config: RenderConfiguration): void {
+    this.config = config;
+    this.quality = resolveQualityProfile(config.quality);
+    this.resize();
+  }
+
   public resize(): void {
-    const dpr = window.devicePixelRatio || 1;
-    const cssW = window.innerWidth;
-    const cssH = window.innerHeight;
-    this.dpr = dpr;
-    this.devW = Math.floor(cssW * dpr);
-    this.devH = Math.floor(cssH * dpr);
+    const next = resolveRenderProfile(
+      this.config,
+      window.innerWidth,
+      window.innerHeight,
+      window.devicePixelRatio || 1
+    );
+    if (sameProfile(this.profile, next)) return;
+    this.profile = next;
+    this.applyProfile();
+  }
+
+  private applyProfile(): void {
+    const p = this.profile;
+    this.pixelRatio = p.pixelRatio;
+    this.devW = p.devW;
+    this.devH = p.devH;
 
     this.canvas.width = this.devW;
     this.canvas.height = this.devH;
-    this.canvas.style.width = `${cssW}px`;
-    this.canvas.style.height = `${cssH}px`;
+    this.canvas.style.position = 'absolute';
+    this.canvas.style.left = `${p.left}px`;
+    this.canvas.style.top = `${p.top}px`;
+    this.canvas.style.width = `${p.displayW}px`;
+    this.canvas.style.height = `${p.displayH}px`;
 
-    const fs = this.fontSize * dpr;
-    this.fontNormal = `${fs}px "Courier New", monospace`;
-    this.fontBold = `bold ${fs}px "Courier New", monospace`;
+    const g = resolveGrid(p, this.fontSize);
+    this.fontNormal = `${g.fontPx}px "Courier New", monospace`;
+    this.fontBold = `bold ${g.fontPx}px "Courier New", monospace`;
 
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -107,17 +155,17 @@ export class AsciiRenderer {
     ctx.font = this.fontNormal;
     ctx.textBaseline = 'top';
 
-    this.dcw = fs * 0.6;
-    this.dch = Math.ceil(fs * 1.2);
-    this.charW = this.dcw / dpr;
-    this.charH = this.dch / dpr;
+    this.dcw = g.cellW;
+    this.dch = g.cellH;
+    this.charW = this.dcw / this.pixelRatio;
+    this.charH = this.dch / this.pixelRatio;
 
-    this.cols = Math.max(1, Math.floor(this.devW / this.dcw));
-    this.rows = Math.max(1, Math.floor(this.devH / this.dch));
+    this.cols = g.cols;
+    this.rows = g.rows;
     this.dox = Math.round((this.devW - this.cols * this.dcw) / 2);
     this.doy = Math.round((this.devH - this.rows * this.dch) / 2);
-    this.offsetX = this.dox / dpr;
-    this.offsetY = this.doy / dpr;
+    this.offsetX = p.left + this.dox / this.pixelRatio;
+    this.offsetY = p.top + this.doy / this.pixelRatio;
 
     const size = this.cols * this.rows;
     this.zBuffer = new Float32Array(size);
@@ -145,7 +193,6 @@ export class AsciiRenderer {
     this.chars.fill('');
     this.bgs.fill('');
     this.bold.fill(0);
-    this.drawnCells = 0;
   }
 
   public drawChar(x: number, y: number, char: string, color: string, z: number): void {
@@ -159,7 +206,6 @@ export class AsciiRenderer {
       this.zBuffer[index] = z;
       this.chars[index] = char;
       this.colors[index] = color;
-      this.drawnCells++;
     }
   }
 
@@ -199,59 +245,6 @@ export class AsciiRenderer {
         if (c !== null) this.drawChar(x, y, char, c, z);
       } else {
         this.drawChar(x, y, char, color, z);
-      }
-
-      if (x === xe && y === ye) break;
-      const e2 = 2 * err;
-      if (e2 >= dy) {
-        err += dy;
-        x += sx;
-      }
-      if (e2 <= dx) {
-        err += dx;
-        y += sy;
-      }
-      i++;
-    }
-  }
-
-  public drawLineFogged(
-    x0: number,
-    y0: number,
-    x1: number,
-    y1: number,
-    char: string,
-    z0: number,
-    z1: number,
-    palette: string[],
-    fogStart: number,
-    invRange: number
-  ): void {
-    let x = Math.round(x0);
-    let y = Math.round(y0);
-    const xe = Math.round(x1);
-    const ye = Math.round(y1);
-
-    const dx = Math.abs(xe - x);
-    const dy = -Math.abs(ye - y);
-    const sx = x < xe ? 1 : -1;
-    const sy = y < ye ? 1 : -1;
-    let err = dx + dy;
-
-    const steps = Math.max(dx, -dy);
-    const invZ0 = 1 / z0;
-    const invZ1 = 1 / z1;
-    const levels = palette.length;
-    let i = 0;
-
-    for (;;) {
-      const t = steps === 0 ? 0 : i / steps;
-      const z = 1 / (invZ0 + (invZ1 - invZ0) * t);
-      const fade = 1 - (z - fogStart) * invRange;
-      if (fade > 0) {
-        const idx = Math.min(levels - 1, Math.floor(Math.min(1, fade) * levels));
-        const c = palette[idx];
-        if (c !== undefined) this.drawChar(x, y, char, c, z);
       }
 
       if (x === xe && y === ye) break;
@@ -371,7 +364,6 @@ export class AsciiRenderer {
       dirty[dc++] = i;
     }
 
-    this.dirtyCells = dc;
     if (dc === 0) return;
 
     const dcw = this.dcw;
