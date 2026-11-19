@@ -9,9 +9,9 @@ body {
 }
 
 #app {
-  display: none; /* unused default Vite container */
+  display: none;
 }
 
-#ascii-canvas {
+#game-canvas {
   display: block;
 }

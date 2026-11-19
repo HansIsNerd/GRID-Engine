@@ -7,10 +7,6 @@ export interface Vec4 {
   w: number;
 }
 
-/**
- * 4x4 matrix, COLUMN-MAJOR: element (row r, column c) lives at elements[c * 4 + r].
- * Translation therefore sits at indices 12, 13, 14.
- */
 export class Matrix4 {
   public readonly elements: Float32Array;
 
@@ -22,7 +18,6 @@ export class Matrix4 {
     this.elements[15] = 1;
   }
 
-  /** Returns this * other (other is applied first when transforming a point). */
   public multiply(other: Matrix4): Matrix4 {
     const a = this.elements;
     const b = other.elements;
@@ -32,7 +27,7 @@ export class Matrix4 {
       for (let r = 0; r < 4; r++) {
         let sum = 0;
         for (let k = 0; k < 4; k++) {
-          sum += a[k * 4 + r] * b[c * 4 + k];
+          sum += (a[k * 4 + r] ?? 0) * (b[c * 4 + k] ?? 0);
         }
         o[c * 4 + r] = sum;
       }
@@ -78,7 +73,6 @@ export class Matrix4 {
     return m;
   }
 
-  /** Right-handed perspective, camera looks down -Z, resulting w = -z_view (positive distance). */
   public static perspective(fovY: number, aspect: number, near: number, far: number): Matrix4 {
     const m = new Matrix4();
     const e = m.elements;
@@ -92,27 +86,67 @@ export class Matrix4 {
     return m;
   }
 
-  /**
-   * Affine transform of a point (w assumed 1, NO perspective divide).
-   * Use this for world-space positions, normals and lighting.
-   */
+  public setTRS(
+    px: number,
+    py: number,
+    pz: number,
+    angleY: number,
+    sx: number,
+    sy: number,
+    sz: number
+  ): void {
+    const e = this.elements;
+    const c = Math.cos(angleY);
+    const s = Math.sin(angleY);
+    e[0] = c * sx;
+    e[1] = 0;
+    e[2] = -s * sx;
+    e[3] = 0;
+    e[4] = 0;
+    e[5] = sy;
+    e[6] = 0;
+    e[7] = 0;
+    e[8] = s * sz;
+    e[9] = 0;
+    e[10] = c * sz;
+    e[11] = 0;
+    e[12] = px;
+    e[13] = py;
+    e[14] = pz;
+    e[15] = 1;
+  }
+
   public transformPoint(v: Vector3): Vector3 {
     const e = this.elements;
     return new Vector3(
-      e[0] * v.x + e[4] * v.y + e[8] * v.z + e[12],
-      e[1] * v.x + e[5] * v.y + e[9] * v.z + e[13],
-      e[2] * v.x + e[6] * v.y + e[10] * v.z + e[14]
+      (e[0] ?? 0) * v.x + (e[4] ?? 0) * v.y + (e[8] ?? 0) * v.z + (e[12] ?? 0),
+      (e[1] ?? 0) * v.x + (e[5] ?? 0) * v.y + (e[9] ?? 0) * v.z + (e[13] ?? 0),
+      (e[2] ?? 0) * v.x + (e[6] ?? 0) * v.y + (e[10] ?? 0) * v.z + (e[14] ?? 0)
     );
   }
 
-  /** Full 4D transform. Use this for screen projection and the Z-buffer (w = view depth). */
   public transformPointWithW(v: Vector3): Vec4 {
     const e = this.elements;
     return {
-      x: e[0] * v.x + e[4] * v.y + e[8] * v.z + e[12],
-      y: e[1] * v.x + e[5] * v.y + e[9] * v.z + e[13],
-      z: e[2] * v.x + e[6] * v.y + e[10] * v.z + e[14],
-      w: e[3] * v.x + e[7] * v.y + e[11] * v.z + e[15],
+      x: (e[0] ?? 0) * v.x + (e[4] ?? 0) * v.y + (e[8] ?? 0) * v.z + (e[12] ?? 0),
+      y: (e[1] ?? 0) * v.x + (e[5] ?? 0) * v.y + (e[9] ?? 0) * v.z + (e[13] ?? 0),
+      z: (e[2] ?? 0) * v.x + (e[6] ?? 0) * v.y + (e[10] ?? 0) * v.z + (e[14] ?? 0),
+      w: (e[3] ?? 0) * v.x + (e[7] ?? 0) * v.y + (e[11] ?? 0) * v.z + (e[15] ?? 0),
     };
+  }
+
+  public transformAffineInto(x: number, y: number, z: number, out: Float64Array, offset: number): void {
+    const e = this.elements;
+    out[offset] = (e[0] ?? 0) * x + (e[4] ?? 0) * y + (e[8] ?? 0) * z + (e[12] ?? 0);
+    out[offset + 1] = (e[1] ?? 0) * x + (e[5] ?? 0) * y + (e[9] ?? 0) * z + (e[13] ?? 0);
+    out[offset + 2] = (e[2] ?? 0) * x + (e[6] ?? 0) * y + (e[10] ?? 0) * z + (e[14] ?? 0);
+  }
+
+  public transformInto(x: number, y: number, z: number, out: Float64Array, offset: number): void {
+    const e = this.elements;
+    out[offset] = (e[0] ?? 0) * x + (e[4] ?? 0) * y + (e[8] ?? 0) * z + (e[12] ?? 0);
+    out[offset + 1] = (e[1] ?? 0) * x + (e[5] ?? 0) * y + (e[9] ?? 0) * z + (e[13] ?? 0);
+    out[offset + 2] = (e[2] ?? 0) * x + (e[6] ?? 0) * y + (e[10] ?? 0) * z + (e[14] ?? 0);
+    out[offset + 3] = (e[3] ?? 0) * x + (e[7] ?? 0) * y + (e[11] ?? 0) * z + (e[15] ?? 0);
   }
 }

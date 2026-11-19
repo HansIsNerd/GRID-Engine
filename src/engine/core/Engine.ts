@@ -1,14 +1,8 @@
 import { Vector3 } from '../math/Vector3';
-import { Matrix4, type Vec4 } from '../math/Matrix4';
+import { Matrix4 } from '../math/Matrix4';
 import { fbm2, hash2 } from '../math/Noise';
 import { AsciiRenderer } from '../renderer/AsciiRenderer';
 import { Input } from './Input';
-
-interface ScreenVertex {
-  x: number;
-  y: number;
-  z: number;
-}
 
 interface Rgb {
   r: number;
@@ -99,6 +93,8 @@ const CAMERA_PITCH = -Math.PI / 3;
 const CAMERA_HEIGHT = 10;
 
 const FOG_LEVELS = 24;
+const COLOR_CACHE_LIMIT = 8192;
+const STAT_SMOOTH = 0.1;
 
 const BIOME_WASTES = 0;
 const BIOME_CITY = 1;
@@ -131,7 +127,6 @@ const WASTE_BLOCK_RGB: Rgb = { r: 0, g: 255, b: 130 };
 const GLITCH_BLOCK_RGB: Rgb = { r: 255, g: 30, b: 50 };
 const ACID_DEBRIS_RGB: Rgb = { r: 170, g: 255, b: 0 };
 const ACID_COLORS: string[] = ['#d0ff00', '#a0ff00', '#ffff55'];
-const OBSTACLE_CULL_MARGIN = 8;
 
 const CUBE_HALF = 0.5;
 const ATTACK_RANGE = 2.5;
@@ -352,6 +347,7 @@ export class Engine {
 
   private readonly fogStart: number;
   private readonly fogEnd: number;
+  private readonly fogInvRange: number;
   private readonly floorPalettes: string[][];
   private readonly flashPalettes: string[];
 
@@ -361,8 +357,26 @@ export class Engine {
   private time: number;
   private acidTimer: number;
 
-  private readonly cubeVertices: Vector3[];
-  private readonly cubeFaces: number[][];
+  private readonly cubeLocal: Float64Array;
+  private readonly cubeFaceIdx: Int32Array;
+
+  private readonly scratch4: Float64Array = new Float64Array(4);
+  private readonly lineClip: Float64Array = new Float64Array(8);
+  private readonly boxModel: Matrix4 = new Matrix4();
+  private readonly boxWorld: Float64Array = new Float64Array(24);
+  private readonly boxClip: Float64Array = new Float64Array(32);
+  private readonly polyClip: Float64Array = new Float64Array(24);
+  private readonly polyScreen: Float64Array = new Float64Array(24);
+  private readonly colorCache: Map<number, string> = new Map<number, string>();
+  private projFx: number = 1;
+  private projFy: number = 1;
+
+  private showProfiler: boolean = false;
+  private updateMs: number = 0;
+  private renderMs: number = 0;
+  private presentMs: number = 0;
+  private drawnObjects: number = 0;
+  private culledObjects: number = 0;
 
   private readonly lightDir: Vector3;
 
@@ -436,6 +450,7 @@ export class Engine {
         : FAR;
     this.fogStart = playerDepth;
     this.fogEnd = Math.max(playerDepth + 1, topDepth * 0.95);
+    this.fogInvRange = 1 / (this.fogEnd - this.fogStart);
 
     this.floorPalettes = [];
     for (let b = 0; b < FLOOR_RGB.length; b++) {
@@ -464,24 +479,24 @@ export class Engine {
     this.buildObstacles();
 
     const h = CUBE_HALF;
-    this.cubeVertices = [
-      new Vector3(-h, -h, -h),
-      new Vector3(h, -h, -h),
-      new Vector3(h, h, -h),
-      new Vector3(-h, h, -h),
-      new Vector3(-h, -h, h),
-      new Vector3(h, -h, h),
-      new Vector3(h, h, h),
-      new Vector3(-h, h, h),
-    ];
-    this.cubeFaces = [
-      [4, 5, 6, 7],
-      [1, 0, 3, 2],
-      [5, 1, 2, 6],
-      [0, 4, 7, 3],
-      [3, 7, 6, 2],
-      [0, 1, 5, 4],
-    ];
+    this.cubeLocal = new Float64Array([
+      -h, -h, -h,
+      h, -h, -h,
+      h, h, -h,
+      -h, h, -h,
+      -h, -h, h,
+      h, -h, h,
+      h, h, h,
+      -h, h, h,
+    ]);
+    this.cubeFaceIdx = new Int32Array([
+      4, 5, 6, 7,
+      1, 0, 3, 2,
+      5, 1, 2, 6,
+      0, 4, 7, 3,
+      3, 7, 6, 2,
+      0, 1, 5, 4,
+    ]);
 
     this.lightDir = new Vector3(-0.4, 1.0, 0.6).normalize();
 
@@ -727,7 +742,10 @@ export class Engine {
     const dt = Math.min((now - this.lastTime) / 1000, 0.1);
     this.lastTime = now;
 
+    const t0 = performance.now();
     this.update(dt);
+    const t1 = performance.now();
+    this.updateMs += (t1 - t0 - this.updateMs) * STAT_SMOOTH;
     this.render();
     if (dt > 0) this.fps = this.fps * 0.95 + (1 / dt) * 0.05;
 
@@ -1146,33 +1164,20 @@ export class Engine {
   private getInventoryLayout(): InventoryLayout {
     const r = this.renderer;
 
-    // Grid size in character cells: N slots plus (N - 1) gaps between them.
     const gridW = INV_COLS * SLOT_W + (INV_COLS - 1) * SLOT_GAP;
     const gridH = INV_ROWS * SLOT_H + (INV_ROWS - 1) * SLOT_GAP;
 
-    // Inventory panel = grid + padding on every side.
     const panelW = gridW + PANEL_PAD_X * 2;
     const panelH = gridH + PANEL_PAD_TOP + PANEL_PAD_BOTTOM;
 
-    // Both panels are centered together as ONE block:
-    //   [ inventory panel ][ gap ][ equipment panel ]
-    // so the block's total width is the sum of its parts.
     const equipW = EQUIP_PANEL_W;
     const equipH = panelH;
     const totalW = panelW + PANEL_GAP + equipW;
 
-    // Center the block: (screen width - block width) / 2, floored to a whole cell.
-    // Math.max(0, ...) stops the block from sliding off-screen on tiny windows.
-    // Because the block is centered, the inventory grid is automatically
-    // "shifted left" of screen center by (gap + equipW) / 2 cells.
     const blockX = Math.max(0, Math.floor((r.cols - totalW) / 2));
     const panelY = Math.max(0, Math.floor((r.rows - panelH) / 2));
 
-    // Inventory panel sits at the left edge of the block.
     const panelX = blockX;
-
-    // Equipment panel starts right after the inventory panel plus the gap.
-    // Both panels share panelY and panelH so their tops and bottoms align.
     const equipX = panelX + panelW + PANEL_GAP;
 
     return {
@@ -1180,7 +1185,6 @@ export class Engine {
       panelY,
       panelW,
       panelH,
-      // First slot's top-left corner: panel origin + inner padding.
       gridX: panelX + PANEL_PAD_X,
       gridY: panelY + PANEL_PAD_TOP,
       equipX,
@@ -1218,27 +1222,17 @@ export class Engine {
     if (!item) return;
 
     if (item.type === 'weapon') {
-      // SWAP: the clicked item goes into the weapon slot, and whatever was
-      // equipped (an Item or null) moves into the exact inventory slot that
-      // was clicked. Holding the old value in `previous` first prevents
-      // overwriting it. If nothing was equipped, `previous` is null, so the
-      // slot empties and the net effect is a plain equip. No item is ever
-      // duplicated or lost.
       const previous = this.equippedWeapon;
       this.inventoryItems[slot] = previous;
       this.equippedWeapon = item;
       this.showMessage(`EQUIPPED ${item.name}`);
     } else if (item.type === 'armor') {
-      // Same swap as the weapon, using the armor slot. Armor changes MAX HP,
-      // so current HP is clamped afterwards: swapping to weaker armor can
-      // never leave HP above the new maximum.
       const previous = this.equippedArmor;
       this.inventoryItems[slot] = previous;
       this.equippedArmor = item;
       this.playerHealth = Math.min(this.playerHealth, this.getMaxHP());
       this.showMessage(`EQUIPPED ${item.name}`);
     } else if (item.type === 'core') {
-      // Cores are consumed (slot becomes null) for a permanent base damage bonus.
       this.coreBonus += item.stats.damage ?? 0;
       this.inventoryItems[slot] = null;
       this.isInventoryOpen = false;
@@ -1268,8 +1262,10 @@ export class Engine {
     const ePressed = inp.eJustPressed;
     const rPressed = inp.rJustPressed;
     const savePressed = inp.saveJustPressed;
+    const profPressed = inp.profilerJustPressed;
     inp.resetJustPressed();
 
+    if (profPressed) this.showProfiler = !this.showProfiler;
     if (savePressed) this.saveGame();
     if (this.messageTimer > 0) this.messageTimer = Math.max(0, this.messageTimer - dt);
 
@@ -1343,8 +1339,11 @@ export class Engine {
   }
 
   private render(): void {
+    const t0 = performance.now();
     const r = this.renderer;
     r.clear();
+    this.drawnObjects = 0;
+    this.culledObjects = 0;
 
     const shaking = this.glitching && !this.isInventoryOpen;
     const shakeX = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
@@ -1352,6 +1351,8 @@ export class Engine {
     const shakeZ = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
 
     const proj = Matrix4.perspective(FOV, r.getAspect(), NEAR, FAR);
+    this.projFx = proj.elements[0] ?? 1;
+    this.projFy = proj.elements[5] ?? 1;
     const rotX = Matrix4.rotationX(-this.pitch);
     const rotY = Matrix4.rotationY(-this.yaw);
     const trans = Matrix4.translation(
@@ -1382,7 +1383,31 @@ export class Engine {
     this.drawUI();
     if (this.isInventoryOpen) this.drawInventory();
 
+    const t1 = performance.now();
     r.present();
+    const t2 = performance.now();
+    this.renderMs += (t1 - t0 - this.renderMs) * STAT_SMOOTH;
+    this.presentMs += (t2 - t1 - this.presentMs) * STAT_SMOOTH;
+  }
+
+  private plotWorld(
+    viewProj: Matrix4,
+    x: number,
+    y: number,
+    z: number,
+    char: string,
+    color: string,
+    bias: number
+  ): void {
+    const s = this.scratch4;
+    viewProj.transformInto(x, y, z, s, 0);
+    const w = s[3] ?? 0;
+    if (w <= NEAR) return;
+    const iw = 1 / w;
+    const r = this.renderer;
+    const sx = ((s[0] ?? 0) * iw * 0.5 + 0.5) * r.cols;
+    const sy = (1 - ((s[1] ?? 0) * iw * 0.5 + 0.5)) * r.rows;
+    r.drawChar(sx, sy, char, color, w - bias);
   }
 
   private drawPulseRing(viewProj: Matrix4, radius: number, fade: number, char: string): void {
@@ -1399,15 +1424,15 @@ export class Engine {
 
     for (let i = 0; i < count; i++) {
       const a = i * step;
-      const wp = new Vector3(
+      this.plotWorld(
+        viewProj,
         this.pulseOrigin.x + Math.cos(a) * radius,
         PULSE_RING_HEIGHT,
-        this.pulseOrigin.z + Math.sin(a) * radius
+        this.pulseOrigin.z + Math.sin(a) * radius,
+        char,
+        color,
+        PULSE_DEPTH_BIAS
       );
-      const clip = viewProj.transformPointWithW(wp);
-      if (clip.w <= NEAR) continue;
-      const s = this.toScreen(clip);
-      this.renderer.drawChar(s.x, s.y, char, color, s.z - PULSE_DEPTH_BIAS);
     }
   }
 
@@ -1459,40 +1484,33 @@ export class Engine {
 
   private drawObstacles(viewProj: Matrix4, dim: number): void {
     const tick = Math.floor(this.time * GLITCH_FLICKER_RATE);
+    const rgb: Rgb = { r: 0, g: 0, b: 0 };
+    const pos = new Vector3(0, 0, 0);
     for (const o of this.obstacles) {
       if (o.flicker && hash2(o.x * 1.7, o.z * 2.3, tick) < 0.18) continue;
-      const clip = viewProj.transformPointWithW(new Vector3(o.x, o.height * 0.5, o.z));
-      if (clip.w > this.fogEnd + OBSTACLE_CULL_MARGIN) continue;
-      this.drawBox(
-        viewProj,
-        new Vector3(o.x, 0, o.z),
-        0,
-        { r: o.rgb.r * dim, g: o.rgb.g * dim, b: o.rgb.b * dim },
-        o.half * 2,
-        o.height,
-        o.half * 2,
-        o.minIntensity
-      );
+      rgb.r = o.rgb.r * dim;
+      rgb.g = o.rgb.g * dim;
+      rgb.b = o.rgb.b * dim;
+      pos.x = o.x;
+      pos.y = 0;
+      pos.z = o.z;
+      this.drawBox(viewProj, pos, 0, rgb, o.half * 2, o.height, o.half * 2, o.minIntensity);
     }
   }
 
   private drawParticles(viewProj: Matrix4): void {
     const dimmed = this.isInventoryOpen;
     for (const p of this.particles) {
-      const clip = viewProj.transformPointWithW(p.pos);
-      if (clip.w <= NEAR) continue;
-      const s = this.toScreen(clip);
-      this.renderer.drawChar(s.x, s.y, p.char, dimmed ? '#0a3a2a' : p.color, s.z - PARTICLE_DEPTH_BIAS);
+      this.plotWorld(
+        viewProj,
+        p.pos.x,
+        p.pos.y,
+        p.pos.z,
+        p.char,
+        dimmed ? '#0a3a2a' : p.color,
+        PARTICLE_DEPTH_BIAS
+      );
     }
-  }
-
-  private toScreen(c: Vec4): ScreenVertex {
-    const invW = 1 / c.w;
-    return {
-      x: (c.x * invW * 0.5 + 0.5) * this.renderer.cols,
-      y: (1 - (c.y * invW * 0.5 + 0.5)) * this.renderer.rows,
-      z: c.w,
-    };
   }
 
   private drawFloor(viewProj: Matrix4): void {
@@ -1547,45 +1565,66 @@ export class Engine {
       ch = GLITCH_CHARS.charAt(Math.floor(hc * GLITCH_CHARS.length));
     }
 
-    const a = horizontal ? new Vector3(start, 0, fixed) : new Vector3(fixed, 0, start);
-    const b = horizontal ? new Vector3(end, 0, fixed) : new Vector3(fixed, 0, end);
-    this.drawWorldLine(a, b, viewProj, ch, palette);
+    if (horizontal) {
+      this.drawWorldLine(start, fixed, end, fixed, viewProj, ch, palette);
+    } else {
+      this.drawWorldLine(fixed, start, fixed, end, viewProj, ch, palette);
+    }
   }
 
   private static flatPalette(color: string): string[] {
     return new Array<string>(FOG_LEVELS).fill(color);
   }
 
-  private drawWorldLine(a: Vector3, b: Vector3, viewProj: Matrix4, ch: string, palette: string[]): void {
-    let ca = viewProj.transformPointWithW(a);
-    let cb = viewProj.transformPointWithW(b);
-    if (ca.w <= NEAR && cb.w <= NEAR) return;
+  private drawWorldLine(
+    ax: number,
+    az: number,
+    bx: number,
+    bz: number,
+    viewProj: Matrix4,
+    ch: string,
+    palette: string[]
+  ): void {
+    const c = this.lineClip;
+    viewProj.transformInto(ax, 0, az, c, 0);
+    viewProj.transformInto(bx, 0, bz, c, 4);
+    let xa = c[0] ?? 0;
+    let ya = c[1] ?? 0;
+    let wa = c[3] ?? 0;
+    let xb = c[4] ?? 0;
+    let yb = c[5] ?? 0;
+    let wb = c[7] ?? 0;
 
-    if (ca.w <= NEAR) {
-      const t = (NEAR - ca.w) / (cb.w - ca.w);
-      ca = viewProj.transformPointWithW(a.add(b.subtract(a).multiply(t)));
-    } else if (cb.w <= NEAR) {
-      const t = (NEAR - cb.w) / (ca.w - cb.w);
-      cb = viewProj.transformPointWithW(b.add(a.subtract(b).multiply(t)));
+    if (wa <= NEAR && wb <= NEAR) return;
+
+    if (wa <= NEAR) {
+      const t = (NEAR - wa) / (wb - wa);
+      xa = xa + (xb - xa) * t;
+      ya = ya + (yb - ya) * t;
+      wa = NEAR;
+    } else if (wb <= NEAR) {
+      const t = (NEAR - wb) / (wa - wb);
+      xb = xb + (xa - xb) * t;
+      yb = yb + (ya - yb) * t;
+      wb = NEAR;
     }
 
-    if (ca.w >= this.fogEnd && cb.w >= this.fogEnd) return;
+    if (wa >= this.fogEnd && wb >= this.fogEnd) return;
+    if (xa < -wa && xb < -wb) return;
+    if (xa > wa && xb > wb) return;
+    if (ya < -wa && yb < -wb) return;
+    if (ya > wa && yb > wb) return;
 
-    const sa = this.toScreen(ca);
-    const sb = this.toScreen(cb);
-
-    const fogStart = this.fogStart;
-    const invRange = 1 / (this.fogEnd - this.fogStart);
-    const shade = (z: number): string | null => {
-      const fade = 1 - (z - fogStart) * invRange;
-      if (fade <= 0) return null;
-      const idx = Math.min(FOG_LEVELS - 1, Math.floor(Math.min(1, fade) * FOG_LEVELS));
-      return palette[idx] ?? null;
-    };
-    const fallback = palette[FOG_LEVELS - 1] ?? '#00ff9c';
+    const r = this.renderer;
+    const iwa = 1 / wa;
+    const iwb = 1 / wb;
+    const sxa = (xa * iwa * 0.5 + 0.5) * r.cols;
+    const sya = (1 - (ya * iwa * 0.5 + 0.5)) * r.rows;
+    const sxb = (xb * iwb * 0.5 + 0.5) * r.cols;
+    const syb = (1 - (yb * iwb * 0.5 + 0.5)) * r.rows;
 
     const bias = 0.02;
-    this.renderer.drawLine(sa.x, sa.y, sb.x, sb.y, ch, fallback, sa.z + bias, sb.z + bias, shade);
+    r.drawLineFogged(sxa, sya, sxb, syb, ch, wa + bias, wb + bias, palette, this.fogStart, this.fogInvRange);
   }
 
   private drawCube(
@@ -1599,6 +1638,34 @@ export class Engine {
     this.drawBox(viewProj, pos, facing, rgb, scale, scale, scale, minIntensity);
   }
 
+  private sphereVisible(viewProj: Matrix4, x: number, y: number, z: number, radius: number): boolean {
+    const s = this.scratch4;
+    viewProj.transformInto(x, y, z, s, 0);
+    const cx = s[0] ?? 0;
+    const cy = s[1] ?? 0;
+    const cw = s[3] ?? 0;
+    if (cw + radius < NEAR) return false;
+    if (cw - radius > this.fogEnd) return false;
+    const rx = radius * (this.projFx + 1);
+    const ry = radius * (this.projFy + 1);
+    if (cx + cw < -rx) return false;
+    if (cw - cx < -rx) return false;
+    if (cy + cw < -ry) return false;
+    if (cw - cy < -ry) return false;
+    return true;
+  }
+
+  private colorFor(r: number, g: number, b: number): string {
+    const key = (r << 16) | (g << 8) | b;
+    let s = this.colorCache.get(key);
+    if (s === undefined) {
+      if (this.colorCache.size > COLOR_CACHE_LIMIT) this.colorCache.clear();
+      s = `rgb(${r},${g},${b})`;
+      this.colorCache.set(key, s);
+    }
+    return s;
+  }
+
   private drawBox(
     viewProj: Matrix4,
     pos: Vector3,
@@ -1609,74 +1676,187 @@ export class Engine {
     sz: number,
     minIntensity: number = 0
   ): void {
-    const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF * sy, pos.z)
-      .multiply(Matrix4.rotationY(facing))
-      .multiply(Matrix4.scaling(sx, sy, sz));
+    const cyc = pos.y + CUBE_HALF * sy;
+    const radius = 0.5 * Math.sqrt(sx * sx + sy * sy + sz * sz);
+    if (!this.sphereVisible(viewProj, pos.x, cyc, pos.z, radius)) {
+      this.culledObjects++;
+      return;
+    }
+    this.drawnObjects++;
 
-    const world: Vector3[] = [];
-    const screen: Array<ScreenVertex | null> = [];
-    for (const v of this.cubeVertices) {
-      const wv = model.transformPoint(v);
-      const clip = viewProj.transformPointWithW(wv);
-      world.push(wv);
-      screen.push(clip.w > NEAR ? this.toScreen(clip) : null);
+    const model = this.boxModel;
+    model.setTRS(pos.x, cyc, pos.z, facing, sx, sy, sz);
+
+    const local = this.cubeLocal;
+    const faces = this.cubeFaceIdx;
+    const world = this.boxWorld;
+    const clip = this.boxClip;
+    const pc = this.polyClip;
+    const ps = this.polyScreen;
+    const cam = this.cameraPos;
+    const light = this.lightDir;
+    const r = this.renderer;
+    const cols = r.cols;
+    const rows = r.rows;
+
+    for (let i = 0; i < 8; i++) {
+      const o = i * 3;
+      const lx = local[o] ?? 0;
+      const ly = local[o + 1] ?? 0;
+      const lz = local[o + 2] ?? 0;
+      model.transformAffineInto(lx, ly, lz, world, o);
+      viewProj.transformInto(world[o] ?? 0, world[o + 1] ?? 0, world[o + 2] ?? 0, clip, i * 4);
     }
 
-    for (const face of this.cubeFaces) {
-      const [i0, i1, i2, i3] = face;
-      if (i0 === undefined || i1 === undefined || i2 === undefined || i3 === undefined) continue;
+    for (let f = 0; f < 6; f++) {
+      const fo = f * 4;
+      const j0 = faces[fo] ?? 0;
+      const j1 = faces[fo + 1] ?? 0;
+      const j2 = faces[fo + 2] ?? 0;
+      const j3 = faces[fo + 3] ?? 0;
 
-      const w0 = world[i0];
-      const w1 = world[i1];
-      const w2 = world[i2];
-      const w3 = world[i3];
-      const s0 = screen[i0];
-      const s1 = screen[i1];
-      const s2 = screen[i2];
-      const s3 = screen[i3];
-      if (!w0 || !w1 || !w2 || !w3 || !s0 || !s1 || !s2 || !s3) continue;
+      const x0 = world[j0 * 3] ?? 0;
+      const y0 = world[j0 * 3 + 1] ?? 0;
+      const z0 = world[j0 * 3 + 2] ?? 0;
+      const x1 = world[j1 * 3] ?? 0;
+      const y1 = world[j1 * 3 + 1] ?? 0;
+      const z1 = world[j1 * 3 + 2] ?? 0;
+      const x2 = world[j2 * 3] ?? 0;
+      const y2 = world[j2 * 3 + 1] ?? 0;
+      const z2 = world[j2 * 3 + 2] ?? 0;
+      const x3 = world[j3 * 3] ?? 0;
+      const y3 = world[j3 * 3 + 1] ?? 0;
+      const z3 = world[j3 * 3 + 2] ?? 0;
 
-      const normal = w1.subtract(w0).cross(w2.subtract(w0)).normalize();
+      const ax = x1 - x0;
+      const ay = y1 - y0;
+      const az = z1 - z0;
+      const bx = x2 - x0;
+      const by = y2 - y0;
+      const bz = z2 - z0;
+      let nx = ay * bz - az * by;
+      let ny = az * bx - ax * bz;
+      let nz = ax * by - ay * bx;
+      const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+      if (len < 1e-8) continue;
+      const il = 1 / len;
+      nx *= il;
+      ny *= il;
+      nz *= il;
 
-      const center = w0.add(w1).add(w2).add(w3).multiply(0.25);
-      if (normal.dot(this.cameraPos.subtract(center)) <= 0) continue;
+      const ccx = (x0 + x1 + x2 + x3) * 0.25;
+      const ccy = (y0 + y1 + y2 + y3) * 0.25;
+      const ccz = (z0 + z1 + z2 + z3) * 0.25;
+      if (nx * (cam.x - ccx) + ny * (cam.y - ccy) + nz * (cam.z - ccz) <= 0) continue;
 
-      const diffuse = Math.max(0, normal.dot(this.lightDir));
-      const intensity = Math.min(1, Math.max(minIntensity, 0.15 + 0.85 * diffuse));
+      const depth =
+        ((clip[j0 * 4 + 3] ?? 0) + (clip[j1 * 4 + 3] ?? 0) + (clip[j2 * 4 + 3] ?? 0) + (clip[j3 * 4 + 3] ?? 0)) * 0.25;
+      const fog = Math.min(1, 1 - (depth - this.fogStart) * this.fogInvRange);
+      if (fog <= 0) continue;
+
+      const diffuse = Math.max(0, nx * light.x + ny * light.y + nz * light.z);
+      const intensity = Math.min(1, Math.max(minIntensity, 0.15 + 0.85 * diffuse)) * fog;
 
       const rampIndex = Math.min(ASCII_RAMP.length - 1, Math.floor(intensity * ASCII_RAMP.length));
+      if (rampIndex <= 0) continue;
       const char = ASCII_RAMP.charAt(rampIndex);
-      const color = `rgb(${Math.floor(rgb.r * intensity)},${Math.floor(rgb.g * intensity)},${Math.floor(
-        rgb.b * intensity
-      )})`;
+      const color = this.colorFor(
+        Math.min(255, Math.floor(rgb.r * intensity)),
+        Math.min(255, Math.floor(rgb.g * intensity)),
+        Math.min(255, Math.floor(rgb.b * intensity))
+      );
 
-      this.drawTriangle(s0, s1, s2, char, color);
-      this.drawTriangle(s0, s2, s3, char, color);
+      let n = 0;
+      for (let k = 0; k < 4; k++) {
+        const a = (faces[fo + k] ?? 0) * 4;
+        const b = (faces[fo + ((k + 1) & 3)] ?? 0) * 4;
+        const pax = clip[a] ?? 0;
+        const pay = clip[a + 1] ?? 0;
+        const paw = clip[a + 3] ?? 0;
+        const pbx = clip[b] ?? 0;
+        const pby = clip[b + 1] ?? 0;
+        const pbw = clip[b + 3] ?? 0;
+        const ain = paw > NEAR;
+        const bin = pbw > NEAR;
+        if (ain) {
+          pc[n * 3] = pax;
+          pc[n * 3 + 1] = pay;
+          pc[n * 3 + 2] = paw;
+          n++;
+        }
+        if (ain !== bin) {
+          const t = (NEAR - paw) / (pbw - paw);
+          pc[n * 3] = pax + (pbx - pax) * t;
+          pc[n * 3 + 1] = pay + (pby - pay) * t;
+          pc[n * 3 + 2] = NEAR;
+          n++;
+        }
+      }
+      if (n < 3) continue;
+
+      for (let k = 0; k < n; k++) {
+        const w = pc[k * 3 + 2] ?? NEAR;
+        const iw = 1 / w;
+        ps[k * 3] = ((pc[k * 3] ?? 0) * iw * 0.5 + 0.5) * cols;
+        ps[k * 3 + 1] = (1 - ((pc[k * 3 + 1] ?? 0) * iw * 0.5 + 0.5)) * rows;
+        ps[k * 3 + 2] = w;
+      }
+
+      const sx0 = ps[0] ?? 0;
+      const sy0 = ps[1] ?? 0;
+      const sz0 = ps[2] ?? 1;
+      for (let k = 1; k < n - 1; k++) {
+        this.drawTriangle(
+          sx0,
+          sy0,
+          sz0,
+          ps[k * 3] ?? 0,
+          ps[k * 3 + 1] ?? 0,
+          ps[k * 3 + 2] ?? 1,
+          ps[(k + 1) * 3] ?? 0,
+          ps[(k + 1) * 3 + 1] ?? 0,
+          ps[(k + 1) * 3 + 2] ?? 1,
+          char,
+          color
+        );
+      }
     }
   }
 
-  private drawTriangle(p0: ScreenVertex, p1: ScreenVertex, p2: ScreenVertex, char: string, color: string): void {
-    const area = (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+  private drawTriangle(
+    p0x: number,
+    p0y: number,
+    p0z: number,
+    p1x: number,
+    p1y: number,
+    p1z: number,
+    p2x: number,
+    p2y: number,
+    p2z: number,
+    char: string,
+    color: string
+  ): void {
+    const area = (p1x - p0x) * (p2y - p0y) - (p2x - p0x) * (p1y - p0y);
     if (Math.abs(area) < 0.0001) return;
 
     const r = this.renderer;
-    const minX = Math.max(0, Math.floor(Math.min(p0.x, p1.x, p2.x)));
-    const maxX = Math.min(r.cols - 1, Math.ceil(Math.max(p0.x, p1.x, p2.x)));
-    const minY = Math.max(0, Math.floor(Math.min(p0.y, p1.y, p2.y)));
-    const maxY = Math.min(r.rows - 1, Math.ceil(Math.max(p0.y, p1.y, p2.y)));
+    const minX = Math.max(0, Math.floor(Math.min(p0x, p1x, p2x)));
+    const maxX = Math.min(r.cols - 1, Math.ceil(Math.max(p0x, p1x, p2x)));
+    const minY = Math.max(0, Math.floor(Math.min(p0y, p1y, p2y)));
+    const maxY = Math.min(r.rows - 1, Math.ceil(Math.max(p0y, p1y, p2y)));
 
-    const invZ0 = 1 / p0.z;
-    const invZ1 = 1 / p1.z;
-    const invZ2 = 1 / p2.z;
+    const invZ0 = 1 / p0z;
+    const invZ1 = 1 / p1z;
+    const invZ2 = 1 / p2z;
 
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
         const px = x + 0.5;
         const py = y + 0.5;
 
-        const w0 = (p1.x - p0.x) * (py - p0.y) - (px - p0.x) * (p1.y - p0.y);
-        const w1 = (p2.x - p1.x) * (py - p1.y) - (px - p1.x) * (p2.y - p1.y);
-        const w2 = (p0.x - p2.x) * (py - p2.y) - (px - p2.x) * (p0.y - p2.y);
+        const w0 = (p1x - p0x) * (py - p0y) - (px - p0x) * (p1y - p0y);
+        const w1 = (p2x - p1x) * (py - p1y) - (px - p1x) * (p2y - p1y);
+        const w2 = (p0x - p2x) * (py - p2y) - (px - p2x) * (p0y - p2y);
 
         if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
           const weightP0 = w1 / area;
@@ -1696,11 +1876,6 @@ export class Engine {
     const horizontal = '+' + '-'.repeat(SLOT_W - 2) + '+';
     const middle = '|' + ' '.repeat(SLOT_W - 2) + '|';
 
-    // Slot block layout (rows relative to y):
-    //   y      : label ("WEAPON" / "ARMOR")
-    //   y+1..  : SLOT_H-row bordered box, same size as an inventory slot
-    //   box center row (y + 1 + floor(SLOT_H / 2)) : item glyph inside the box,
-    //   with name / stat text to the right of the box.
     r.drawRawText(x, y, label, INV_TITLE);
 
     const boxY = y + 1;
@@ -1724,8 +1899,6 @@ export class Engine {
     const r = this.renderer;
     r.fillRect(layout.equipX, layout.equipY, layout.equipW, layout.equipH, INV_PANEL_BG);
 
-    // Title centered inside the equipment panel using the same formula as the
-    // inventory title: panel left + floor((panel width - text length) / 2).
     const title = '[ EQUIPMENT ]';
     r.drawRawText(
       layout.equipX + Math.floor((layout.equipW - title.length) / 2),
@@ -1734,9 +1907,6 @@ export class Engine {
       INV_TITLE
     );
 
-    // Slot content is inset by 2 cells from the panel's left edge. Vertical
-    // stack (rows relative to equipY): weapon block at +3 (label + 5-row box
-    // = 6 rows), armor block at +10 (one blank row between), totals at +17.
     const slotX = layout.equipX + 2;
     const weapon = this.equippedWeapon;
     const armor = this.equippedArmor;
@@ -1811,7 +1981,7 @@ export class Engine {
     const r = this.renderer;
     const maxHp = this.getMaxHP();
 
-    r.fillRect(0, 0, 50, 10, '#000000');
+    r.fillRect(0, 0, 50, this.showProfiler ? 13 : 10, '#000000');
 
     r.drawRawText(1, 0, `FPS: ${Math.round(this.fps)}`, '#00ff9c');
     r.drawRawText(
@@ -1841,7 +2011,7 @@ export class Engine {
     r.drawRawText(
       1,
       4,
-      this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'WASD LMB/SPC Q/E/R I:INV P:SAVE',
+      this.isInventoryOpen ? 'PAUSED  INVENTORY: I' : 'WASD LMB/SPC Q/E/R I:INV P:SAVE F3:PROF',
       '#2a7a5a'
     );
 
@@ -1884,6 +2054,17 @@ export class Engine {
       r.drawRawText(1, 9, this.message, '#ffd028');
     } else {
       r.drawRawText(1, 9, `Q BOMB ${BOMB_COST}  E BLINK ${BLINK_COST}  R OVRCLK ${OVERCLOCK_COST}`, '#2a7a5a');
+    }
+
+    if (this.showProfiler) {
+      r.drawRawText(
+        1,
+        10,
+        `UPD ${this.updateMs.toFixed(2)}  RND ${this.renderMs.toFixed(2)}  PRS ${this.presentMs.toFixed(2)} ms`,
+        '#ffd028'
+      );
+      r.drawRawText(1, 11, `CELLS ${r.drawnCells}  DIRTY ${r.dirtyCells}`, '#ffd028');
+      r.drawRawText(1, 12, `OBJ ${this.drawnObjects}  CULL ${this.culledObjects}`, '#ffd028');
     }
   }
 }

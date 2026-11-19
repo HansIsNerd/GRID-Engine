@@ -10,6 +10,7 @@ export class Input {
   public spaceJustPressed: boolean = false;
   public inventoryJustPressed: boolean = false;
   public saveJustPressed: boolean = false;
+  public profilerJustPressed: boolean = false;
 
   public qJustPressed: boolean = false;
   public eJustPressed: boolean = false;
@@ -20,7 +21,7 @@ export class Input {
 
   constructor() {
     window.addEventListener('keydown', (e) => {
-      if (e.code === 'Space') e.preventDefault();
+      if (e.code === 'Space' || e.code === 'F3') e.preventDefault();
       if (!e.repeat) {
         if (e.code === 'KeyI') this.inventoryJustPressed = true;
         if (e.code === 'KeyP') this.saveJustPressed = true;
@@ -28,6 +29,7 @@ export class Input {
         if (e.code === 'KeyQ') this.qJustPressed = true;
         if (e.code === 'KeyE') this.eJustPressed = true;
         if (e.code === 'KeyR') this.rJustPressed = true;
+        if (e.code === 'F3') this.profilerJustPressed = true;
       }
       this.handleKey(e.code, true);
     });
@@ -71,6 +73,7 @@ export class Input {
     this.spaceJustPressed = false;
     this.inventoryJustPressed = false;
     this.saveJustPressed = false;
+    this.profilerJustPressed = false;
     this.qJustPressed = false;
     this.eJustPressed = false;
     this.rJustPressed = false;
