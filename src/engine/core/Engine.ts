@@ -25,6 +25,8 @@ interface FloatingText {
   color: string;
 }
 
+type HumanoidPointGroup = 'body' | 'leftArm' | 'rightArm' | 'leftLeg' | 'rightLeg';
+
 interface Particle {
   pos: Vector3;
   vel: Vector3;
@@ -114,6 +116,8 @@ const GRID_STEP = 2;
 const GRID_MAJOR = 10;
 const FONT_SIZE = 8.5;
 const MOVE_SPEED = 6;
+const HUMANOID_POINT_GLYPH = '*';
+const HUMANOID_POINT_COLOR = '#00ffff';
 
 const CAMERA_PITCH = -Math.PI / 3;
 const CAMERA_HEIGHT = 10;
@@ -360,6 +364,10 @@ export class Engine {
   private npcRespawnTimer: number;
 
   private readonly particles: Particle[];
+  private readonly humanoidPoints: Vector3[];
+  private readonly humanoidPointGroups: HumanoidPointGroup[];
+  private readonly pointCloudClip: Float64Array;
+  private isPlayerMoving: boolean;
   private readonly floatingTexts: FloatingText[];
   private shakeIntensity: number;
   private readonly lootItems: Loot[];
@@ -438,6 +446,10 @@ export class Engine {
     this.npcRespawnTimer = 0;
 
     this.particles = [];
+    this.humanoidPointGroups = [];
+    this.humanoidPoints = this.generateHumanoidPoints();
+    this.pointCloudClip = new Float64Array(4);
+    this.isPlayerMoving = false;
     this.floatingTexts = [];
     this.shakeIntensity = 0;
     this.lootItems = [];
@@ -680,6 +692,182 @@ export class Engine {
       }
     }
     return false;
+  }
+
+  /**
+   * Generate a reusable point cloud for a stylized humanoid.
+   * Total target is ~430 surface points; generation runs once at construction.
+   */
+  private generateHumanoidPoints(): Vector3[] {
+    const points: Vector3[] = [];
+    this.humanoidPointGroups.length = 0;
+
+    const addPoint = (x: number, y: number, z: number, group: HumanoidPointGroup = 'body'): void => {
+      points.push(new Vector3(x, y, z));
+      this.humanoidPointGroups.push(group);
+    };
+
+    // Head: Fibonacci-distributed points on a 0.4-radius sphere centered at y=2.5.
+    const headCount = 72;
+    const headRadius = 0.4;
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < headCount; i++) {
+      const t = 1 - (2 * (i + 0.5)) / headCount;
+      const ringRadius = Math.sqrt(Math.max(0, 1 - t * t));
+      const angle = goldenAngle * i;
+      addPoint(
+        Math.cos(angle) * ringRadius * headRadius,
+        2.5 + t * headRadius,
+        Math.sin(angle) * ringRadius * headRadius
+      );
+    }
+
+    // Torso: 15 rings × 8 samples, 1.2 wide and 1.8 tall.
+    const torsoRings = 15;
+    const torsoSegments = 8;
+    const torsoBottom = 0.8;
+    const torsoHeight = 1.8;
+    const torsoRadius = 0.6;
+    for (let ring = 0; ring < torsoRings; ring++) {
+      const y = torsoBottom + (ring / (torsoRings - 1)) * torsoHeight;
+      const taper = 0.88 + 0.12 * Math.sin((ring / (torsoRings - 1)) * Math.PI);
+      for (let segment = 0; segment < torsoSegments; segment++) {
+        const angle = (segment / torsoSegments) * Math.PI * 2;
+        addPoint(
+          Math.cos(angle) * torsoRadius * taper,
+          y,
+          Math.sin(angle) * torsoRadius * taper * 0.72
+        );
+      }
+    }
+
+    // Helper for evenly sampled cylindrical limbs between two local-space points.
+    const addLimb = (
+      start: Vector3,
+      end: Vector3,
+      radius: number,
+      longitudinalSegments: number,
+      radialSegments: number,
+      group: HumanoidPointGroup
+    ): void => {
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const dz = end.z - start.z;
+      const length = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      const ax = dx / length;
+      const ay = dy / length;
+      const az = dz / length;
+
+      const rx = Math.abs(az) > 0.9 ? 1 : 0;
+      const rz = Math.abs(az) > 0.9 ? 0 : 1;
+      let ux = ay * rz;
+      let uy = az * rx - ax * rz;
+      let uz = -ay * rx;
+      const uLength = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
+      ux /= uLength;
+      uy /= uLength;
+      uz /= uLength;
+
+      const vx = ay * uz - az * uy;
+      const vy = az * ux - ax * uz;
+      const vz = ax * uy - ay * ux;
+
+      for (let step = 0; step <= longitudinalSegments; step++) {
+        const t = step / longitudinalSegments;
+        const cx = start.x + dx * t;
+        const cy = start.y + dy * t;
+        const cz = start.z + dz * t;
+        for (let side = 0; side < radialSegments; side++) {
+          const angle = (side / radialSegments) * Math.PI * 2;
+          const c = Math.cos(angle) * radius;
+          const s = Math.sin(angle) * radius;
+          addPoint(
+            cx + ux * c + vx * s,
+            cy + uy * c + vy * s,
+            cz + uz * c + vz * s,
+            group
+          );
+        }
+      }
+    };
+
+    // Arms: shoulders to hands.
+    addLimb(new Vector3(-0.48, 2.25, 0), new Vector3(-1.02, 1.22, 0.02), 0.12, 12, 5, 'leftArm');
+    addLimb(new Vector3(0.48, 2.25, 0), new Vector3(1.02, 1.22, 0.02), 0.12, 12, 5, 'rightArm');
+
+    // Legs: hips to feet.
+    addLimb(new Vector3(-0.28, 0.92, 0), new Vector3(-0.32, 0.10, 0), 0.16, 10, 5, 'leftLeg');
+    addLimb(new Vector3(0.28, 0.92, 0), new Vector3(0.32, 0.10, 0), 0.16, 10, 5, 'rightLeg');
+
+    return points;
+  }
+
+  /**
+   * Project the prebuilt point cloud into the existing ASCII depth buffer.
+   * Rotation and animation values are calculated once per frame; points and
+   * the clip buffer are reused to avoid per-point allocations.
+   */
+  private drawPointCloudCharacter(pos: Vector3, facing: number, viewProj: Matrix4): void {
+    const points = this.humanoidPoints;
+    const groups = this.humanoidPointGroups;
+    const clip = this.pointCloudClip;
+    const moving = this.isPlayerMoving;
+    const phase = this.time * 9;
+    const leftSwing = moving ? Math.sin(phase) * 0.22 : 0;
+    const rightSwing = moving ? Math.sin(phase + Math.PI) * 0.22 : 0;
+    const armLift = moving ? Math.abs(Math.sin(phase)) * 0.05 : 0;
+    const leftLegSwing = moving ? Math.sin(phase + Math.PI) * 0.2 : 0;
+    const rightLegSwing = moving ? Math.sin(phase) * 0.2 : 0;
+    const legLift = moving ? Math.abs(Math.sin(phase)) * 0.07 : 0;
+
+    const cosFacing = Math.cos(facing);
+    const sinFacing = Math.sin(facing);
+    const renderer = this.renderer;
+    const cols = renderer.cols;
+    const rows = renderer.rows;
+
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      if (!point) continue;
+
+      let localY = point.y;
+      let localZ = point.z;
+      const group = groups[i];
+
+      if (group === 'leftArm') {
+        localY += armLift;
+        localZ += leftSwing;
+      } else if (group === 'rightArm') {
+        localY += armLift;
+        localZ += rightSwing;
+      } else if (group === 'leftLeg') {
+        localY += legLift;
+        localZ += leftLegSwing;
+      } else if (group === 'rightLeg') {
+        localY += legLift;
+        localZ += rightLegSwing;
+      }
+
+      const worldX = pos.x + point.x * cosFacing + localZ * sinFacing;
+      const worldY = pos.y + localY;
+      const worldZ = pos.z - point.x * sinFacing + localZ * cosFacing;
+
+      viewProj.transformInto(worldX, worldY, worldZ, clip, 0);
+
+      const clipW = clip[3] ?? 0;
+      if (clipW <= NEAR || clipW >= FAR) continue;
+
+      const invW = 1 / clipW;
+      const screenX = (clip[0] ?? 0) * invW * 0.5 + 0.5;
+      const screenY = 1 - ((clip[1] ?? 0) * invW * 0.5 + 0.5);
+      renderer.drawChar(
+        screenX * cols,
+        screenY * rows,
+        HUMANOID_POINT_GLYPH,
+        HUMANOID_POINT_COLOR,
+        clipW
+      );
+    }
   }
 
   private showMessage(text: string): void {
@@ -1387,6 +1575,7 @@ export class Engine {
 
   private update(dt: number): void {
     this.time += dt;
+    this.isPlayerMoving = false;
     this.shakeIntensity *= Math.exp(-9 * dt);
     if (this.shakeIntensity < 0.005) this.shakeIntensity = 0;
     this.updateFloatingTexts(dt);
@@ -1448,6 +1637,8 @@ export class Engine {
     if (inp.right) dx += 1;
 
     if (dx !== 0 || dz !== 0) {
+      const movementStartX = this.playerPos.x;
+      const movementStartZ = this.playerPos.z;
       const dir = new Vector3(dx, 0, dz).normalize();
       const speed = MOVE_SPEED * (this.overclockTimer > 0 ? OVERCLOCK_MULT : 1);
 
@@ -1466,6 +1657,9 @@ export class Engine {
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
       this.facing += diff * (1 - Math.exp(-14 * dt));
+      this.isPlayerMoving =
+        Math.abs(this.playerPos.x - movementStartX) > 0.0001 ||
+        Math.abs(this.playerPos.z - movementStartZ) > 0.0001;
     }
 
     if ((click || space) && this.npcAlive() && this.distanceToNpc() < ATTACK_RANGE) {
@@ -1524,11 +1718,7 @@ export class Engine {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
       this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
     }
-    this.drawCube(viewProj, this.playerPos, this.facing, {
-      r: PLAYER_RGB.r * dim,
-      g: PLAYER_RGB.g * dim,
-      b: PLAYER_RGB.b * dim,
-    });
+    this.drawPointCloudCharacter(this.playerPos, this.facing, viewProj);
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
