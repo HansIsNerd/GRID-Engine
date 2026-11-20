@@ -3,6 +3,7 @@ import { Matrix4, type Vec4 } from '../math/Matrix4';
 import { fbm2, hash2 } from '../math/Noise';
 import { AsciiRenderer } from '../renderer/AsciiRenderer';
 import { Input } from './Input';
+import { Audio as GameAudio } from './Audio';
 import { FOG_LEVELS, RenderConfigStore, SETTINGS_SECTIONS } from './RenderConfig';
 
 interface ScreenVertex {
@@ -15,6 +16,13 @@ interface Rgb {
   r: number;
   g: number;
   b: number;
+}
+
+interface FloatingText {
+  text: string;
+  pos: Vector3;
+  life: number;
+  color: string;
 }
 
 interface Particle {
@@ -322,6 +330,7 @@ export class Engine {
   private readonly configStore: RenderConfigStore;
   private readonly renderer: AsciiRenderer;
   private readonly input: Input;
+  private readonly audio: GameAudio;
 
   private readonly playerPos: Vector3;
   private facing: number;
@@ -351,6 +360,8 @@ export class Engine {
   private npcRespawnTimer: number;
 
   private readonly particles: Particle[];
+  private readonly floatingTexts: FloatingText[];
+  private shakeIntensity: number;
   private readonly lootItems: Loot[];
   private readonly expFragments: ExpFragment[];
 
@@ -398,6 +409,7 @@ export class Engine {
       this.renderer.setConfig(c);
     });
     this.input = new Input();
+    this.audio = new GameAudio();
     this.playerPos = new Vector3(0, 0, 0);
     this.facing = 0;
     this.playerHealth = PLAYER_BASE_HP;
@@ -426,6 +438,8 @@ export class Engine {
     this.npcRespawnTimer = 0;
 
     this.particles = [];
+    this.floatingTexts = [];
+    this.shakeIntensity = 0;
     this.lootItems = [];
     this.expFragments = [];
 
@@ -790,6 +804,15 @@ export class Engine {
     if (!this.npcAlive()) return;
     this.npcHealth = Math.max(0, this.npcHealth - amount);
     this.npcHitTimer = HIT_FLASH_TIME;
+    this.audio.playHitSound();
+    this.shakeIntensity = 0.5;
+    if (this.floatingTexts.length >= 64) this.floatingTexts.shift();
+    this.floatingTexts.push({
+      text: `-${Math.round(amount)}`,
+      pos: new Vector3(this.npcPos.x, this.npcPos.y + 1.5, this.npcPos.z),
+      life: 0.9,
+      color: '#ff4055',
+    });
     this.spawnHitEffect(this.npcPos, colors);
     if (this.npcHealth <= 0) this.killNpc();
   }
@@ -845,6 +868,22 @@ export class Engine {
         color: colors[Math.floor(Math.random() * colors.length)] ?? '#00ff9c',
         gravity: GRAVITY * 0.5,
       });
+    }
+  }
+
+  private updateFloatingTexts(dt: number): void {
+    for (let i = this.floatingTexts.length - 1; i >= 0; i--) {
+      const floating = this.floatingTexts[i];
+      if (!floating) continue;
+
+      floating.life -= dt;
+      floating.pos.y += 1.35 * dt;
+
+      if (floating.life <= 0) {
+        const last = this.floatingTexts[this.floatingTexts.length - 1];
+        if (last) this.floatingTexts[i] = last;
+        this.floatingTexts.pop();
+      }
     }
   }
 
@@ -947,7 +986,10 @@ export class Engine {
       this.grantCyberCore();
       leveled = true;
     }
-    if (leveled) this.triggerResonancePulse();
+    if (leveled) {
+      this.audio.playLevelUpSound();
+      this.triggerResonancePulse();
+    }
   }
 
   private updateLoot(dt: number): void {
@@ -1014,6 +1056,7 @@ export class Engine {
   private castLogicBomb(): void {
     if (this.ram < BOMB_COST) return;
     this.ram -= BOMB_COST;
+    this.audio.playGlitchSound();
     for (let i = 0; i < 3; i++) this.spawnPickupEffect(this.playerPos, BOMB_COLORS);
     if (this.npcAlive() && this.distanceToNpc() <= BOMB_RADIUS) {
       this.damageNpc(BOMB_DAMAGE_BASE + BOMB_DAMAGE_PER_LEVEL * this.playerLevel, BOMB_COLORS);
@@ -1038,6 +1081,7 @@ export class Engine {
     }
     if (x === ox && z === oz) return;
     this.ram -= BLINK_COST;
+    this.audio.playGlitchSound();
     this.spawnPickupEffect(new Vector3(ox, 0, oz), BLINK_COLORS);
     this.playerPos.x = x;
     this.playerPos.z = z;
@@ -1048,6 +1092,7 @@ export class Engine {
   private castOverclock(): void {
     if (this.ram < OVERCLOCK_COST) return;
     this.ram -= OVERCLOCK_COST;
+    this.audio.playGlitchSound();
     this.overclockTimer = OVERCLOCK_TIME;
     this.spawnPickupEffect(this.playerPos, OVERCLOCK_COLORS);
   }
@@ -1128,6 +1173,7 @@ export class Engine {
 
     if (this.distanceToNpc() < NPC_ATTACK_RANGE && this.npcAttackCooldown <= 0) {
       this.playerHealth = Math.max(0, this.playerHealth - NPC_ATTACK_DAMAGE);
+      this.audio.playGlitchSound();
       this.npcAttackCooldown = NPC_ATTACK_COOLDOWN;
       this.spawnHitEffect(this.playerPos, BLOOD_COLORS);
     }
@@ -1142,6 +1188,7 @@ export class Engine {
     while (this.acidTimer >= ACID_TICK) {
       this.acidTimer -= ACID_TICK;
       this.playerHealth = Math.max(0, this.playerHealth - ACID_DAMAGE);
+      this.audio.playGlitchSound();
       this.spawnHitEffect(this.playerPos, ACID_COLORS);
     }
   }
@@ -1340,6 +1387,9 @@ export class Engine {
 
   private update(dt: number): void {
     this.time += dt;
+    this.shakeIntensity *= Math.exp(-9 * dt);
+    if (this.shakeIntensity < 0.005) this.shakeIntensity = 0;
+    this.updateFloatingTexts(dt);
 
     const inp = this.input;
     const invToggle = inp.inventoryJustPressed;
@@ -1446,9 +1496,13 @@ export class Engine {
 
     const overlay = this.overlayOpen();
     const shaking = this.glitching && !overlay;
-    const shakeX = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
-    const shakeY = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
-    const shakeZ = shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0;
+    const hitShake = overlay ? 0 : this.shakeIntensity;
+    const shakeX = (shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0)
+      + (Math.random() * 2 - 1) * hitShake;
+    const shakeY = (shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0)
+      + (Math.random() * 2 - 1) * hitShake;
+    const shakeZ = (shaking ? (Math.random() * 2 - 1) * SHAKE_AMP : 0)
+      + (Math.random() * 2 - 1) * hitShake;
 
     const proj = Matrix4.perspective(FOV, r.getAspect(), NEAR, FAR);
     const rotX = Matrix4.rotationX(-this.pitch);
@@ -1478,11 +1532,24 @@ export class Engine {
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
+    this.drawFloatingTexts(viewProj);
     if (this.isInventoryOpen) this.drawInventory();
     if (this.isSettingsOpen) this.drawSettings();
 
     r.present();
     this.drawUI();
+  }
+
+  private drawFloatingTexts(viewProj: Matrix4): void {
+    for (const floating of this.floatingTexts) {
+      const clip = viewProj.transformPointWithW(floating.pos);
+      if (clip.w <= NEAR || clip.w >= FAR) continue;
+
+      const screen = this.toScreen(clip);
+      const col = Math.round(screen.x - floating.text.length * 0.5);
+      const row = Math.round(screen.y);
+      this.renderer.drawRawText(col, row, floating.text, floating.color);
+    }
   }
 
   private drawPulseRing(viewProj: Matrix4, radius: number, fade: number, char: string): void {
