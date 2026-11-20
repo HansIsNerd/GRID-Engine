@@ -98,7 +98,7 @@ type NpcState = 'idle' | 'chase';
 
 const NEAR = 0.5;
 const FAR = 100;
-const FOV = Math.PI / 3;
+const FOV = Math.PI / 4;
 
 const GRID_HALF = 60;
 const GRID_SIZE = GRID_HALF * 2 + 1;
@@ -107,8 +107,9 @@ const GRID_MAJOR = 10;
 const FONT_SIZE = 8.5;
 const MOVE_SPEED = 6;
 
-const CAMERA_PITCH = -Math.PI / 3;
-const CAMERA_HEIGHT = 10;
+const CAMERA_PITCH = -Math.PI / 4;
+const CAMERA_HEIGHT = 7;
+const CAMERA_BACK_DISTANCE = 7;
 
 const BIOME_WASTES = 0;
 const BIOME_CITY = 1;
@@ -451,8 +452,8 @@ export class Engine {
     this.pitch = CAMERA_PITCH;
     this.yaw = 0;
     const tilt = -this.pitch;
-    const backDist = CAMERA_HEIGHT / Math.tan(tilt);
-    this.cameraOffset = new Vector3(0, CAMERA_HEIGHT, backDist);
+    const backDist = CAMERA_BACK_DISTANCE;
+    this.cameraOffset = new Vector3(0, CAMERA_HEIGHT, CAMERA_BACK_DISTANCE);
     this.cameraPos = this.playerPos.add(this.cameraOffset);
 
     const playerDepth = CAMERA_HEIGHT * Math.sin(tilt) + backDist * Math.cos(tilt);
@@ -572,7 +573,7 @@ export class Engine {
 
         if (biome === BIOME_CITY) {
           if ((x & 1) !== 0 || (z & 1) !== 0) continue;
-          if (r >= 0.42) continue;
+          if (r >= 0.48) continue;
           if (r2 < 0.75) {
             this.addObstacle({
               x,
@@ -597,7 +598,7 @@ export class Engine {
             });
           }
         } else if (biome === BIOME_WASTES) {
-          if (r < 0.04) {
+          if (r < 0.05) {
             this.addObstacle({
               x,
               z,
@@ -608,7 +609,7 @@ export class Engine {
               rgb: DEBRIS_RGB,
               minIntensity: 0.3,
             });
-          } else if (r < 0.055) {
+          } else if (r < 0.07) {
             this.addObstacle({
               x,
               z,
@@ -621,7 +622,7 @@ export class Engine {
             });
           }
         } else if (biome === BIOME_GLITCH) {
-          if (r < 0.06) {
+          if (r < 0.075) {
             this.addObstacle({
               x,
               z,
@@ -633,7 +634,7 @@ export class Engine {
               minIntensity: 0.4,
             });
           }
-        } else if (r < 0.02) {
+        } else if (r < 0.025) {
           this.addObstacle({
             x,
             z,
@@ -1468,13 +1469,29 @@ export class Engine {
     this.drawExpFragments(viewProj, dim);
     if (this.npcAlive()) {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
-      this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
+      this.drawBox(
+        viewProj,
+        this.npcPos,
+        this.npcFacing,
+        { r: base.r * dim, g: base.g * dim, b: base.b * dim },
+        1.5,
+        2.5,
+        1.5
+      );
     }
-    this.drawCube(viewProj, this.playerPos, this.facing, {
-      r: PLAYER_RGB.r * dim,
-      g: PLAYER_RGB.g * dim,
-      b: PLAYER_RGB.b * dim,
-    });
+    this.drawBox(
+      viewProj,
+      this.playerPos,
+      this.facing,
+      {
+        r: PLAYER_RGB.r * dim,
+        g: PLAYER_RGB.g * dim,
+        b: PLAYER_RGB.b * dim,
+      },
+      1.5,
+      2.0,
+      1.5
+    );
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
@@ -1569,7 +1586,7 @@ export class Engine {
         0,
         { r: o.rgb.r * dim, g: o.rgb.g * dim, b: o.rgb.b * dim },
         o.half * 2,
-        o.height,
+        Math.max(o.height * 1.25, o.solid ? 2.0 : 0.65),
         o.half * 2,
         o.minIntensity
       );
@@ -1776,6 +1793,7 @@ export class Engine {
 
     for (let y = minY; y <= maxY; y++) {
       for (let x = minX; x <= maxX; x++) {
+        // Sample the center of each ASCII cell for stable coverage at high density.
         const px = x + 0.5;
         const py = y + 0.5;
 

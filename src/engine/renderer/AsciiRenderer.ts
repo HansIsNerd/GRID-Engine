@@ -336,52 +336,6 @@ export class AsciiRenderer {
     }
   }
 
-  public drawHudOverlay(lines: ReadonlyArray<{ readonly text: string; readonly color: string }>): void {
-    const ctx = this.ctx;
-    const baseFontPx = Number.parseFloat(this.fontNormal) || this.fontSize;
-    const fontPx = Math.max(12, baseFontPx * 1.45);
-    const lineHeight = Math.ceil(fontPx * 1.65);
-    const padX = Math.ceil(fontPx * 0.9);
-    const padY = Math.ceil(fontPx * 0.75);
-    const x = Math.max(8, Math.round(this.dox + 8));
-    const y = Math.max(8, Math.round(this.doy + 8));
-    const maxWidth = Math.max(0, this.devW - x - 16);
-
-    ctx.save();
-    ctx.font = `bold ${fontPx}px "Courier New", monospace`;
-    ctx.textBaseline = 'top';
-
-    let textWidth = 0;
-    for (const line of lines) {
-      if (line.text.length === 0) continue;
-      textWidth = Math.max(textWidth, ctx.measureText(line.text).width);
-    }
-
-    const panelW = Math.min(maxWidth, Math.ceil(textWidth + padX * 2));
-    const panelH = Math.min(this.devH - y - 8, padY * 2 + lines.length * lineHeight);
-
-    ctx.globalAlpha = 0.94;
-    ctx.fillStyle = '#000805';
-    ctx.fillRect(x, y, panelW, panelH);
-    ctx.globalAlpha = 0.9;
-    ctx.strokeStyle = '#145b43';
-    ctx.lineWidth = Math.max(1, fontPx * 0.055);
-    ctx.strokeRect(x + 0.5, y + 0.5, Math.max(0, panelW - 1), Math.max(0, panelH - 1));
-
-    ctx.beginPath();
-    ctx.rect(x + padX, y + padY, Math.max(0, panelW - padX * 2), Math.max(0, panelH - padY * 2));
-    ctx.clip();
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line || line.text.length === 0) continue;
-      ctx.fillStyle = line.color;
-      ctx.fillText(line.text, x + padX, y + padY + i * lineHeight);
-    }
-
-    ctx.restore();
-  }
-
   public present(): void {
     const ctx = this.ctx;
     const cols = this.cols;
