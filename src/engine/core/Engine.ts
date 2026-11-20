@@ -119,6 +119,23 @@ const MOVE_SPEED = 6;
 const HUMANOID_POINT_GLYPH = '*';
 const HUMANOID_POINT_COLOR = '#00ffff';
 
+const HOLO_GLYPHS = '@#*.';
+const HOLO_LEVELS = 8;
+const HOLO_DEPTH_HALF = 1.6;
+const HOLO_CENTER_HEIGHT = 1.4;
+
+const SHADOW_COLOR = 'rgb(0,15,0)';
+const SHADOW_GLYPH = ':';
+const SHADOW_RING_STEP = 0.35;
+const SHADOW_ARC_STEP = 0.4;
+const SHADOW_DEPTH_BIAS = 0.01;
+const PLAYER_SHADOW_RADIUS = 0.8;
+const NPC_SHADOW_RADIUS = 0.9;
+const TOWER_SHADOW_SCALE = 1.7;
+
+const OBJECT_FOG_START = 12;
+const OBJECT_FOG_END = 40;
+
 const CAMERA_PITCH = -Math.PI / 3;
 const CAMERA_HEIGHT = 10;
 
@@ -367,6 +384,7 @@ export class Engine {
   private readonly humanoidPoints: Vector3[];
   private readonly humanoidPointGroups: HumanoidPointGroup[];
   private readonly pointCloudClip: Float64Array;
+  private readonly holoPalette: string[];
   private isPlayerMoving: boolean;
   private readonly floatingTexts: FloatingText[];
   private shakeIntensity: number;
@@ -449,6 +467,11 @@ export class Engine {
     this.humanoidPointGroups = [];
     this.humanoidPoints = this.generateHumanoidPoints();
     this.pointCloudClip = new Float64Array(4);
+    this.holoPalette = [];
+    for (let i = 0; i < HOLO_LEVELS; i++) {
+      const f = 1 - i / (HOLO_LEVELS - 1);
+      this.holoPalette.push(`rgb(${Math.floor(20 * f)},${Math.floor(70 + 185 * f)},${Math.floor(90 + 165 * f)})`);
+    }
     this.isPlayerMoving = false;
     this.floatingTexts = [];
     this.shakeIntensity = 0;
@@ -694,10 +717,6 @@ export class Engine {
     return false;
   }
 
-  /**
-   * Generate a reusable point cloud for a stylized humanoid.
-   * Total target is ~430 surface points; generation runs once at construction.
-   */
   private generateHumanoidPoints(): Vector3[] {
     const points: Vector3[] = [];
     this.humanoidPointGroups.length = 0;
@@ -707,7 +726,6 @@ export class Engine {
       this.humanoidPointGroups.push(group);
     };
 
-    // Head: Fibonacci-distributed points on a 0.4-radius sphere centered at y=2.5.
     const headCount = 72;
     const headRadius = 0.4;
     const goldenAngle = Math.PI * (3 - Math.sqrt(5));
@@ -722,7 +740,6 @@ export class Engine {
       );
     }
 
-    // Torso: 15 rings × 8 samples, 1.2 wide and 1.8 tall.
     const torsoRings = 15;
     const torsoSegments = 8;
     const torsoBottom = 0.8;
@@ -741,7 +758,6 @@ export class Engine {
       }
     }
 
-    // Helper for evenly sampled cylindrical limbs between two local-space points.
     const addLimb = (
       start: Vector3,
       end: Vector3,
@@ -791,26 +807,22 @@ export class Engine {
       }
     };
 
-    // Arms: shoulders to hands.
     addLimb(new Vector3(-0.48, 2.25, 0), new Vector3(-1.02, 1.22, 0.02), 0.12, 12, 5, 'leftArm');
     addLimb(new Vector3(0.48, 2.25, 0), new Vector3(1.02, 1.22, 0.02), 0.12, 12, 5, 'rightArm');
 
-    // Legs: hips to feet.
     addLimb(new Vector3(-0.28, 0.92, 0), new Vector3(-0.32, 0.10, 0), 0.16, 10, 5, 'leftLeg');
     addLimb(new Vector3(0.28, 0.92, 0), new Vector3(0.32, 0.10, 0), 0.16, 10, 5, 'rightLeg');
 
     return points;
   }
 
-  /**
-   * Project the prebuilt point cloud into the existing ASCII depth buffer.
-   * Rotation and animation values are calculated once per frame; points and
-   * the clip buffer are reused to avoid per-point allocations.
-   */
   private drawPointCloudCharacter(pos: Vector3, facing: number, viewProj: Matrix4): void {
     const points = this.humanoidPoints;
     const groups = this.humanoidPointGroups;
     const clip = this.pointCloudClip;
+    const palette = this.holoPalette;
+    const paletteLen = palette.length;
+    const glyphLen = HOLO_GLYPHS.length;
     const moving = this.isPlayerMoving;
     const phase = this.time * 9;
     const leftSwing = moving ? Math.sin(phase) * 0.22 : 0;
@@ -825,6 +837,11 @@ export class Engine {
     const renderer = this.renderer;
     const cols = renderer.cols;
     const rows = renderer.rows;
+
+    viewProj.transformInto(pos.x, pos.y + HOLO_CENTER_HEIGHT, pos.z, clip, 0);
+    const centerW = clip[3] ?? 0;
+    const depthMin = centerW - HOLO_DEPTH_HALF;
+    const depthInv = 1 / (HOLO_DEPTH_HALF * 2);
 
     for (let i = 0; i < points.length; i++) {
       const point = points[i];
@@ -860,14 +877,53 @@ export class Engine {
       const invW = 1 / clipW;
       const screenX = (clip[0] ?? 0) * invW * 0.5 + 0.5;
       const screenY = 1 - ((clip[1] ?? 0) * invW * 0.5 + 0.5);
-      renderer.drawChar(
-        screenX * cols,
-        screenY * rows,
-        HUMANOID_POINT_GLYPH,
-        HUMANOID_POINT_COLOR,
-        clipW
-      );
+
+      const t = Math.max(0, Math.min(0.999, (clipW - depthMin) * depthInv));
+      const glyph = HOLO_GLYPHS.charAt(Math.min(glyphLen - 1, Math.floor(t * glyphLen)));
+      const color = palette[Math.min(paletteLen - 1, Math.floor(t * paletteLen))] ?? HUMANOID_POINT_COLOR;
+
+      renderer.drawChar(screenX * cols, screenY * rows, glyph, color, clipW);
     }
+  }
+
+  private drawShadow(pos: Vector3, radius: number, viewProj: Matrix4): void {
+    if (radius <= 0) return;
+    const clip = this.pointCloudClip;
+    const renderer = this.renderer;
+    const cols = renderer.cols;
+    const rows = renderer.rows;
+    const rings = Math.max(1, Math.ceil(radius / SHADOW_RING_STEP));
+
+    for (let ring = 0; ring <= rings; ring++) {
+      const rr = (ring / rings) * radius;
+      const count = ring === 0 ? 1 : Math.max(6, Math.ceil((Math.PI * 2 * rr) / SHADOW_ARC_STEP));
+      const step = (Math.PI * 2) / count;
+      for (let i = 0; i < count; i++) {
+        const a = i * step;
+        viewProj.transformInto(pos.x + Math.cos(a) * rr, 0, pos.z + Math.sin(a) * rr, clip, 0);
+        const w = clip[3] ?? 0;
+        if (w <= NEAR || w >= FAR) continue;
+        const invW = 1 / w;
+        const sx = ((clip[0] ?? 0) * invW * 0.5 + 0.5) * cols;
+        const sy = (1 - ((clip[1] ?? 0) * invW * 0.5 + 0.5)) * rows;
+        renderer.drawChar(sx, sy, SHADOW_GLYPH, SHADOW_COLOR, w + SHADOW_DEPTH_BIAS);
+      }
+    }
+  }
+
+  private drawShadows(viewProj: Matrix4): void {
+    const camX = this.cameraPos.x;
+    const camZ = this.cameraPos.z;
+    const maxD = OBJECT_FOG_END;
+    for (const o of this.obstacles) {
+      if (o.rgb !== TOWER_RGB) continue;
+      const dx = o.x - camX;
+      const dz = o.z - camZ;
+      if (dx * dx + dz * dz > maxD * maxD) continue;
+      this.drawShadow(new Vector3(o.x, 0, o.z), o.half * TOWER_SHADOW_SCALE, viewProj);
+    }
+    if (this.npcAlive()) this.drawShadow(this.npcPos, NPC_SHADOW_RADIUS, viewProj);
+    this.drawShadow(this.playerPos, PLAYER_SHADOW_RADIUS, viewProj);
   }
 
   private showMessage(text: string): void {
@@ -1711,6 +1767,7 @@ export class Engine {
     const dim = overlay ? DIM_FACTOR : 1;
 
     this.drawFloor(viewProj);
+    this.drawShadows(viewProj);
     this.drawObstacles(viewProj, dim);
     this.drawLoot(viewProj, dim);
     this.drawExpFragments(viewProj, dim);
@@ -1967,6 +2024,16 @@ export class Engine {
     sz: number,
     minIntensity: number = 0
   ): void {
+    const cdx = this.cameraPos.x - pos.x;
+    const cdy = this.cameraPos.y - (pos.y + CUBE_HALF * sy);
+    const cdz = this.cameraPos.z - pos.z;
+    const dist = Math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz);
+    const objFog = Math.max(
+      0,
+      Math.min(1, 1 - (dist - OBJECT_FOG_START) / (OBJECT_FOG_END - OBJECT_FOG_START))
+    );
+    if (objFog <= 0) return;
+
     const model = Matrix4.translation(pos.x, pos.y + CUBE_HALF * sy, pos.z)
       .multiply(Matrix4.rotationY(facing))
       .multiply(Matrix4.scaling(sx, sy, sz));
@@ -2005,11 +2072,12 @@ export class Engine {
       const diffuse = Math.max(0, normal.dot(this.lightDir));
       const intensity = Math.min(1, Math.max(minIntensity, 0.15 + 0.85 * diffuse));
       const shadeI = colorSteps > 0 ? Math.min(1, Math.ceil(intensity * colorSteps) / colorSteps) : intensity;
+      const finalI = shadeI * objFog;
 
-      const rampIndex = Math.min(ramp.length - 1, Math.floor(intensity * ramp.length));
+      const rampIndex = Math.min(ramp.length - 1, Math.floor(intensity * objFog * ramp.length));
       const char = ramp.charAt(rampIndex);
-      const color = `rgb(${Math.floor(rgb.r * shadeI)},${Math.floor(rgb.g * shadeI)},${Math.floor(
-        rgb.b * shadeI
+      const color = `rgb(${Math.floor(rgb.r * finalI)},${Math.floor(rgb.g * finalI)},${Math.floor(
+        rgb.b * finalI
       )})`;
 
       this.drawTriangle(s0, s1, s2, char, color);

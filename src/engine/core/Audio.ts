@@ -1,15 +1,9 @@
-/**
- * Lightweight procedural game audio using the Web Audio API.
- * No external audio assets or third-party dependencies are required.
- */
 export class Audio {
   private context: AudioContext | null = null;
   private masterGain: GainNode | null = null;
   private noiseBuffer: AudioBuffer | null = null;
 
   constructor() {
-    // Browsers require audio to be started from a user gesture.
-    // These one-shot listeners unlock the context on the first key or pointer input.
     window.addEventListener('pointerdown', () => this.unlock(), { once: true, passive: true });
     window.addEventListener('keydown', () => this.unlock(), { once: true });
   }
