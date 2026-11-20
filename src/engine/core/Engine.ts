@@ -1586,7 +1586,7 @@ export class Engine {
         0,
         { r: o.rgb.r * dim, g: o.rgb.g * dim, b: o.rgb.b * dim },
         o.half * 2,
-        Math.max(o.height * 1.25, o.solid ? 2.0 : 0.65),
+        Math.max(o.height * 1.25, o.solid ? 5.0 : 0.65),
         o.half * 2,
         o.minIntensity
       );
