@@ -1,7 +1,7 @@
 import { Vector3 } from '../math/Vector3';
 import { Matrix4, type Vec4 } from '../math/Matrix4';
 import { fbm2, hash2 } from '../math/Noise';
-import { AsciiRenderer } from '../renderer/AsciiRenderer';
+import { WebGLRenderer } from '../renderer/WebGLRenderer';
 import { Input } from './Input';
 import { Audio as GameAudio } from './Audio';
 import { FOG_LEVELS, RenderConfigStore, SETTINGS_SECTIONS } from './RenderConfig';
@@ -24,8 +24,6 @@ interface FloatingText {
   life: number;
   color: string;
 }
-
-type HumanoidPointGroup = 'body' | 'leftArm' | 'rightArm' | 'leftLeg' | 'rightLeg';
 
 interface Particle {
   pos: Vector3;
@@ -104,6 +102,11 @@ interface Obstacle {
   minIntensity: number;
 }
 
+interface BodyPoint {
+  pos: Vector3;
+  part: 'head' | 'torso' | 'lArm' | 'rArm' | 'lLeg' | 'rLeg';
+}
+
 type NpcState = 'idle' | 'chase';
 
 const NEAR = 0.5;
@@ -116,13 +119,7 @@ const GRID_STEP = 2;
 const GRID_MAJOR = 10;
 const FONT_SIZE = 8.5;
 const MOVE_SPEED = 6;
-const HUMANOID_POINT_GLYPH = '*';
-const HUMANOID_POINT_COLOR = '#00ffff';
-
-const HOLO_GLYPHS = '@#*.';
-const HOLO_LEVELS = 8;
-const HOLO_DEPTH_HALF = 1.6;
-const HOLO_CENTER_HEIGHT = 1.4;
+const HUMANOID_ROOT_Y = 0.75; // Keep the feet on the world floor (Y = 0).
 
 const SHADOW_COLOR = 'rgb(0,15,0)';
 const SHADOW_GLYPH = ':';
@@ -349,7 +346,7 @@ function isItem(v: unknown): v is Item {
 
 export class Engine {
   private readonly configStore: RenderConfigStore;
-  private readonly renderer: AsciiRenderer;
+  private readonly renderer: WebGLRenderer;
   private readonly input: Input;
   private readonly audio: GameAudio;
 
@@ -381,11 +378,11 @@ export class Engine {
   private npcRespawnTimer: number;
 
   private readonly particles: Particle[];
-  private readonly humanoidPoints: Vector3[];
-  private readonly humanoidPointGroups: HumanoidPointGroup[];
+  private readonly characterPoints: BodyPoint[];
   private readonly pointCloudClip: Float64Array;
-  private readonly holoPalette: string[];
   private isPlayerMoving: boolean;
+  private walkTime: number;
+  private walkBlend: number;
   private readonly floatingTexts: FloatingText[];
   private shakeIntensity: number;
   private readonly lootItems: Loot[];
@@ -430,7 +427,7 @@ export class Engine {
 
   constructor(canvas: HTMLCanvasElement) {
     this.configStore = new RenderConfigStore();
-    this.renderer = new AsciiRenderer(canvas, FONT_SIZE, this.configStore.get());
+    this.renderer = new WebGLRenderer(canvas, FONT_SIZE, this.configStore.get());
     this.configStore.subscribe((c) => {
       this.renderer.setConfig(c);
     });
@@ -464,15 +461,11 @@ export class Engine {
     this.npcRespawnTimer = 0;
 
     this.particles = [];
-    this.humanoidPointGroups = [];
-    this.humanoidPoints = this.generateHumanoidPoints();
+    this.characterPoints = this.generateHumanoidPoints();
     this.pointCloudClip = new Float64Array(4);
-    this.holoPalette = [];
-    for (let i = 0; i < HOLO_LEVELS; i++) {
-      const f = 1 - i / (HOLO_LEVELS - 1);
-      this.holoPalette.push(`rgb(${Math.floor(20 * f)},${Math.floor(70 + 185 * f)},${Math.floor(90 + 165 * f)})`);
-    }
     this.isPlayerMoving = false;
+    this.walkTime = 0;
+    this.walkBlend = 0;
     this.floatingTexts = [];
     this.shakeIntensity = 0;
     this.lootItems = [];
@@ -717,172 +710,231 @@ export class Engine {
     return false;
   }
 
-  private generateHumanoidPoints(): Vector3[] {
-    const points: Vector3[] = [];
-    this.humanoidPointGroups.length = 0;
+  /**
+   * Generates a deterministic, low-cost humanoid surface point cloud.
+   * Each primitive uses 8 angular segments and 5 surface rings.
+   * Total: 242 points (head 42, torso 40, arms 80, legs 80).
+   */
+  private generateHumanoidPoints(): BodyPoint[] {
+    const points: BodyPoint[] = [];
+    const SEGMENTS = 8;
+    const RINGS = 5;
+    const TAU = Math.PI * 2;
 
-    const addPoint = (x: number, y: number, z: number, group: HumanoidPointGroup = 'body'): void => {
-      points.push(new Vector3(x, y, z));
-      this.humanoidPointGroups.push(group);
+    const addPoint = (
+      x: number,
+      y: number,
+      z: number,
+      part: BodyPoint['part']
+    ): void => {
+      points.push({ pos: new Vector3(x, y, z), part });
     };
 
-    const headCount = 72;
-    const headRadius = 0.4;
-    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-    for (let i = 0; i < headCount; i++) {
-      const t = 1 - (2 * (i + 0.5)) / headCount;
-      const ringRadius = Math.sqrt(Math.max(0, 1 - t * t));
-      const angle = goldenAngle * i;
-      addPoint(
-        Math.cos(angle) * ringRadius * headRadius,
-        2.5 + t * headRadius,
-        Math.sin(angle) * ringRadius * headRadius
-      );
-    }
+    // Head: sphere (radius 0.45, center Y = 2.8).
+    // Five latitude rings plus the two poles preserve the rounded silhouette.
+    const headRadius = 0.45;
+    const headCenterY = 2.8;
 
-    const torsoRings = 15;
-    const torsoSegments = 8;
-    const torsoBottom = 0.8;
-    const torsoHeight = 1.8;
-    const torsoRadius = 0.6;
-    for (let ring = 0; ring < torsoRings; ring++) {
-      const y = torsoBottom + (ring / (torsoRings - 1)) * torsoHeight;
-      const taper = 0.88 + 0.12 * Math.sin((ring / (torsoRings - 1)) * Math.PI);
-      for (let segment = 0; segment < torsoSegments; segment++) {
-        const angle = (segment / torsoSegments) * Math.PI * 2;
+    for (let ring = 0; ring < RINGS; ring++) {
+      const phi = -Math.PI / 2 + ((ring + 1) / (RINGS + 1)) * Math.PI;
+      const ringRadius = headRadius * Math.cos(phi);
+      const y = headCenterY + headRadius * Math.sin(phi);
+
+      for (let segment = 0; segment < SEGMENTS; segment++) {
+        const theta = (segment / SEGMENTS) * TAU;
         addPoint(
-          Math.cos(angle) * torsoRadius * taper,
+          ringRadius * Math.cos(theta),
           y,
-          Math.sin(angle) * torsoRadius * taper * 0.72
+          ringRadius * Math.sin(theta),
+          'head'
         );
       }
     }
 
-    const addLimb = (
-      start: Vector3,
-      end: Vector3,
-      radius: number,
-      longitudinalSegments: number,
-      radialSegments: number,
-      group: HumanoidPointGroup
+    addPoint(0, headCenterY + headRadius, 0, 'head');
+    addPoint(0, headCenterY - headRadius, 0, 'head');
+
+    // Surface sampler for vertical cylinders and the tapered torso.
+    const addCylinderSurface = (
+      centerX: number,
+      centerY: number,
+      radiusBottom: number,
+      radiusTop: number,
+      height: number,
+      part: BodyPoint['part']
     ): void => {
-      const dx = end.x - start.x;
-      const dy = end.y - start.y;
-      const dz = end.z - start.z;
-      const length = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
-      const ax = dx / length;
-      const ay = dy / length;
-      const az = dz / length;
+      for (let ring = 0; ring < RINGS; ring++) {
+        const t = ring / (RINGS - 1);
+        const y = centerY - height / 2 + t * height;
+        const radius = radiusBottom + (radiusTop - radiusBottom) * t;
 
-      const rx = Math.abs(az) > 0.9 ? 1 : 0;
-      const rz = Math.abs(az) > 0.9 ? 0 : 1;
-      let ux = ay * rz;
-      let uy = az * rx - ax * rz;
-      let uz = -ay * rx;
-      const uLength = Math.sqrt(ux * ux + uy * uy + uz * uz) || 1;
-      ux /= uLength;
-      uy /= uLength;
-      uz /= uLength;
-
-      const vx = ay * uz - az * uy;
-      const vy = az * ux - ax * uz;
-      const vz = ax * uy - ay * ux;
-
-      for (let step = 0; step <= longitudinalSegments; step++) {
-        const t = step / longitudinalSegments;
-        const cx = start.x + dx * t;
-        const cy = start.y + dy * t;
-        const cz = start.z + dz * t;
-        for (let side = 0; side < radialSegments; side++) {
-          const angle = (side / radialSegments) * Math.PI * 2;
-          const c = Math.cos(angle) * radius;
-          const s = Math.sin(angle) * radius;
+        for (let segment = 0; segment < SEGMENTS; segment++) {
+          const theta = (segment / SEGMENTS) * TAU;
           addPoint(
-            cx + ux * c + vx * s,
-            cy + uy * c + vy * s,
-            cz + uz * c + vz * s,
-            group
+            centerX + radius * Math.cos(theta),
+            y,
+            radius * Math.sin(theta),
+            part
           );
         }
       }
     };
 
-    addLimb(new Vector3(-0.48, 2.25, 0), new Vector3(-1.02, 1.22, 0.02), 0.12, 12, 5, 'leftArm');
-    addLimb(new Vector3(0.48, 2.25, 0), new Vector3(1.02, 1.22, 0.02), 0.12, 12, 5, 'rightArm');
+    // Torso: tapered cylinder, top radius 0.7, bottom radius 0.45.
+    addCylinderSurface(0, 1.6, 0.45, 0.7, 1.6, 'torso');
 
-    addLimb(new Vector3(-0.28, 0.92, 0), new Vector3(-0.32, 0.10, 0), 0.16, 10, 5, 'leftLeg');
-    addLimb(new Vector3(0.28, 0.92, 0), new Vector3(0.32, 0.10, 0), 0.16, 10, 5, 'rightLeg');
+    // Arms: radius 0.15, height 1.4, centered at X = +/-0.85, Y = 1.6.
+    addCylinderSurface(-0.85, 1.6, 0.15, 0.15, 1.4, 'lArm');
+    addCylinderSurface(0.85, 1.6, 0.15, 0.15, 1.4, 'rArm');
+
+    // Legs: radius 0.2, height 1.5, centered at X = +/-0.3, Y = 0.
+    addCylinderSurface(-0.3, 0, 0.2, 0.2, 1.5, 'lLeg');
+    addCylinderSurface(0.3, 0, 0.2, 0.2, 1.5, 'rLeg');
 
     return points;
   }
 
-  private drawPointCloudCharacter(pos: Vector3, facing: number, viewProj: Matrix4): void {
-    const points = this.humanoidPoints;
-    const groups = this.humanoidPointGroups;
-    const clip = this.pointCloudClip;
-    const palette = this.holoPalette;
-    const paletteLen = palette.length;
-    const glyphLen = HOLO_GLYPHS.length;
-    const moving = this.isPlayerMoving;
-    const phase = this.time * 9;
-    const leftSwing = moving ? Math.sin(phase) * 0.22 : 0;
-    const rightSwing = moving ? Math.sin(phase + Math.PI) * 0.22 : 0;
-    const armLift = moving ? Math.abs(Math.sin(phase)) * 0.05 : 0;
-    const leftLegSwing = moving ? Math.sin(phase + Math.PI) * 0.2 : 0;
-    const rightLegSwing = moving ? Math.sin(phase) * 0.2 : 0;
-    const legLift = moving ? Math.abs(Math.sin(phase)) * 0.07 : 0;
+  /**
+   * Animates, transforms, projects, and draws the humanoid using the same
+   * Matrix4 + WebGLRenderer path as the rest of the world geometry.
+   */
+  private drawPointCloudCharacter(
+    viewProj: Matrix4,
+    origin: Vector3,
+    facing: number,
+    dim: number
+  ): void {
+    if (this.characterPoints.length === 0) return;
 
-    const cosFacing = Math.cos(facing);
-    const sinFacing = Math.sin(facing);
-    const renderer = this.renderer;
-    const cols = renderer.cols;
-    const rows = renderer.rows;
+    const swing = Math.sin(this.walkTime) * 0.55 * this.walkBlend;
+    const bodyBob = Math.sin(this.walkTime * 2) * 0.045 * this.walkBlend;
+    const facingCos = Math.cos(facing);
+    const facingSin = Math.sin(facing);
 
-    viewProj.transformInto(pos.x, pos.y + HOLO_CENTER_HEIGHT, pos.z, clip, 0);
-    const centerW = clip[3] ?? 0;
-    const depthMin = centerW - HOLO_DEPTH_HALF;
-    const depthInv = 1 / (HOLO_DEPTH_HALF * 2);
+    type ProjectedPoint = {
+      x: number;
+      y: number;
+      depth: number;
+    };
 
-    for (let i = 0; i < points.length; i++) {
-      const point = points[i];
-      if (!point) continue;
+    const projected: ProjectedPoint[] = [];
+    let minDepth = Infinity;
+    let maxDepth = -Infinity;
 
-      let localY = point.y;
-      let localZ = point.z;
-      const group = groups[i];
+    for (const bodyPoint of this.characterPoints) {
+      let { x, y, z } = bodyPoint.pos;
+      const part = bodyPoint.part;
 
-      if (group === 'leftArm') {
-        localY += armLift;
-        localZ += leftSwing;
-      } else if (group === 'rightArm') {
-        localY += armLift;
-        localZ += rightSwing;
-      } else if (group === 'leftLeg') {
-        localY += legLift;
-        localZ += leftLegSwing;
-      } else if (group === 'rightLeg') {
-        localY += legLift;
-        localZ += rightLegSwing;
+      // Head, torso, and arms follow the subtle upper-body bob.
+      if (part === 'head' || part === 'torso' || part === 'lArm' || part === 'rArm') {
+        y += bodyBob;
       }
 
-      const worldX = pos.x + point.x * cosFacing + localZ * sinFacing;
-      const worldY = pos.y + localY;
-      const worldZ = pos.z - point.x * sinFacing + localZ * cosFacing;
+      // Swing each arm around its shoulder (rotation around local X).
+      if (part === 'lArm' || part === 'rArm') {
+        const side = part === 'lArm' ? -1 : 1;
+        const pivotY = 2.3 + bodyBob;
+        const angle = -side * swing;
+        const dy = y - pivotY;
+        const dz = z;
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
 
-      viewProj.transformInto(worldX, worldY, worldZ, clip, 0);
+        y = pivotY + dy * cos - dz * sin;
+        z = dy * sin + dz * cos;
+      }
 
-      const clipW = clip[3] ?? 0;
-      if (clipW <= NEAR || clipW >= FAR) continue;
+      // Swing each leg around its hip; opposite phase to the corresponding arm.
+      if (part === 'lLeg' || part === 'rLeg') {
+        const side = part === 'lLeg' ? -1 : 1;
+        const pivotY = 0.75;
+        const angle = side * swing * 0.85;
+        const dy = y - pivotY;
+        const dz = z;
+        const cos = Math.cos(angle);
+        const sin = Math.sin(angle);
 
-      const invW = 1 / clipW;
-      const screenX = (clip[0] ?? 0) * invW * 0.5 + 0.5;
-      const screenY = 1 - ((clip[1] ?? 0) * invW * 0.5 + 0.5);
+        y = pivotY + dy * cos - dz * sin;
+        z = dy * sin + dz * cos;
+      }
 
-      const t = Math.max(0, Math.min(0.999, (clipW - depthMin) * depthInv));
-      const glyph = HOLO_GLYPHS.charAt(Math.min(glyphLen - 1, Math.floor(t * glyphLen)));
-      const color = palette[Math.min(paletteLen - 1, Math.floor(t * paletteLen))] ?? HUMANOID_POINT_COLOR;
+      // Rotate the complete local character to match the player's facing.
+      const localX = x * facingCos + z * facingSin;
+      const localZ = -x * facingSin + z * facingCos;
 
-      renderer.drawChar(screenX * cols, screenY * rows, glyph, color, clipW);
+      // The source geometry is centered on the legs; lift its root so feet sit at Y=0.
+      const worldPosition = new Vector3(
+        origin.x + localX,
+        origin.y + HUMANOID_ROOT_Y + y,
+        origin.z + localZ
+      );
+
+      const clip = viewProj.transformPointWithW(worldPosition);
+      if (!Number.isFinite(clip.w) || clip.w <= NEAR || clip.w >= FAR) continue;
+
+      const screen = this.toScreen(clip);
+      if (!Number.isFinite(screen.x) || !Number.isFinite(screen.y)) continue;
+      if (screen.x < 0 || screen.x >= this.renderer.cols || screen.y < 0 || screen.y >= this.renderer.rows) {
+        continue;
+      }
+
+      projected.push({ x: screen.x, y: screen.y, depth: screen.z });
+      minDepth = Math.min(minDepth, screen.z);
+      maxDepth = Math.max(maxDepth, screen.z);
+    }
+
+    if (projected.length === 0) return;
+
+    // In this engine clip.w / ScreenVertex.z is camera depth: smaller is nearer.
+    const depthRange = Math.max(maxDepth - minDepth, 1e-6);
+
+    type CellPoint = ProjectedPoint & {
+      glyph: '@' | '#' | '.';
+      color: string;
+    };
+
+    // Collapse overlapping samples to the nearest sample in each ASCII cell.
+    const cells = new Map<number, CellPoint>();
+    const cols = this.renderer.cols;
+
+    const colorForDepth = (r: number, g: number, b: number): string =>
+      `rgb(${Math.round(r * dim)},${Math.round(g * dim)},${Math.round(b * dim)})`;
+
+    for (const point of projected) {
+      const closeness = (maxDepth - point.depth) / depthRange;
+      let glyph: CellPoint['glyph'];
+      let color: string;
+
+      if (closeness >= 0.66) {
+        glyph = '@';
+        color = colorForDepth(98, 247, 255);
+      } else if (closeness >= 0.33) {
+        glyph = '#';
+        color = colorForDepth(0, 184, 206);
+      } else {
+        glyph = '.';
+        color = colorForDepth(36, 89, 104);
+      }
+
+      const cellX = Math.floor(point.x);
+      const cellY = Math.floor(point.y);
+      const key = cellY * cols + cellX;
+      const existing = cells.get(key);
+
+      // Smaller camera depth is closer, matching WebGLRenderer's depth convention.
+      if (!existing || point.depth < existing.depth) {
+        cells.set(key, { ...point, glyph, color });
+      }
+    }
+
+    for (const point of cells.values()) {
+      this.renderer.drawChar(
+        Math.floor(point.x),
+        Math.floor(point.y),
+        point.glyph,
+        point.color,
+        point.depth
+      );
     }
   }
 
@@ -1629,6 +1681,13 @@ export class Engine {
     }
   }
 
+  private updateWalkAnimation(dt: number): void {
+    const targetBlend = this.isPlayerMoving ? 1 : 0;
+    const blendRate = 1 - Math.exp(-12 * dt);
+    this.walkBlend += (targetBlend - this.walkBlend) * blendRate;
+    if (this.isPlayerMoving) this.walkTime += dt * 9;
+  }
+
   private update(dt: number): void {
     this.time += dt;
     this.isPlayerMoving = false;
@@ -1668,12 +1727,14 @@ export class Engine {
 
     if (this.isSettingsOpen) {
       this.updateSettings(navUp, navDown, navLeft, navRight, enter, click);
+      this.updateWalkAnimation(dt);
       return;
     }
 
     if (this.isInventoryOpen) {
       this.hoverSlot = this.slotAtMouse();
       this.handleInventoryClick(click);
+      this.updateWalkAnimation(dt);
       return;
     }
 
@@ -1717,6 +1778,8 @@ export class Engine {
         Math.abs(this.playerPos.x - movementStartX) > 0.0001 ||
         Math.abs(this.playerPos.z - movementStartZ) > 0.0001;
     }
+
+    this.updateWalkAnimation(dt);
 
     if ((click || space) && this.npcAlive() && this.distanceToNpc() < ATTACK_RANGE) {
       this.damageNpc(this.getAttackDamage(), SPARK_COLORS);
@@ -1775,7 +1838,7 @@ export class Engine {
       const base = this.npcHitTimer > 0 ? FLASH_RGB : NPC_RGB;
       this.drawCube(viewProj, this.npcPos, this.npcFacing, { r: base.r * dim, g: base.g * dim, b: base.b * dim });
     }
-    this.drawPointCloudCharacter(this.playerPos, this.facing, viewProj);
+    this.drawPointCloudCharacter(viewProj, this.playerPos, this.facing, dim);
     this.drawPulse(viewProj);
     this.drawParticles(viewProj);
     if (shaking) r.glitchRows(GLITCH_ROWS, GLITCH_SHIFT);
@@ -2279,51 +2342,81 @@ export class Engine {
   }
 
   private drawUI(): void {
+    const renderer = this.renderer;
     const maxHp = this.getMaxHP();
-    const hpRatio = Math.max(0, Math.min(1, this.playerHealth / maxHp));
-    const hpFilled = Math.round(hpRatio * HP_BAR_WIDTH);
-    const hpColor = hpRatio > 0.5 ? '#00ff9c' : hpRatio > 0.25 ? '#ffd028' : '#ff2020';
-    const hpBar = `[${'#'.repeat(hpFilled)}${'-'.repeat(HP_BAR_WIDTH - hpFilled)}]`;
 
-    const ramRatio = Math.max(0, Math.min(1, this.ram / RAM_MAX));
-    const ramFilled = Math.round(ramRatio * HP_BAR_WIDTH);
-    const ramColor = this.glitching ? '#ff2040' : '#33aaff';
-    const ramBar = `[${'#'.repeat(ramFilled)}${'-'.repeat(HP_BAR_WIDTH - ramFilled)}]`;
+    const clamp01 = (value: number): number =>
+      Math.max(0, Math.min(1, value));
 
+    const makeBar = (ratio: number, width: number): string => {
+      const filled = Math.round(clamp01(ratio) * width);
+      return `[${'|'.repeat(filled)}${' '.repeat(width - filled)}]`;
+    };
+
+    // Size the terminal panel in character cells. drawHudOverlay performs
+    // the pixel scaling and anchors the panel inside the renderer viewport.
+    const panelWidth = Math.min(56, Math.max(8, renderer.cols - 4));
+    const innerWidth = panelWidth - 2;
+    const compact = innerWidth < 30;
+    const barWidth = Math.max(2, Math.min(10, innerWidth - (compact ? 12 : 18)));
+
+    const row = (value: string): string =>
+      `|${value.slice(0, innerWidth).padEnd(innerWidth, ' ')}|`;
+    const border = `+${'-'.repeat(innerWidth)}+`;
+
+    const hpRatio = clamp01(this.playerHealth / Math.max(1, maxHp));
+    const ramRatio = clamp01(this.ram / RAM_MAX);
+    const expRatio = clamp01(this.playerExp / Math.max(1, this.expToNextLevel));
+
+    const hpColor = hpRatio <= 0.25 ? '#ff335f' : '#ff5b91';
+    const ramColor = '#35b9ff';
     const biome = this.biomeAtPos(this.playerPos.x, this.playerPos.z);
-    const biomeText = biome === BIOME_ACID
-      ? `BIOME: ${BIOME_NAMES[biome]}  !! -${ACID_DAMAGE} HP/s`
-      : `BIOME: ${BIOME_NAMES[biome] ?? 'UNKNOWN'}`;
+    const biomeName = BIOME_NAMES[biome] ?? 'UNKNOWN';
+    const biomeColor = BIOME_UI_COLORS[biome] ?? '#00e5ff';
 
     const enemyText = this.npcAlive()
-      ? (this.distanceToNpc() < TARGET_UI_RANGE ? `ENEMY HP: ${this.npcHealth}/${this.npcMaxHp}` : '')
-      : `ENEMY DEFEATED  RESPAWN: ${Math.max(0, Math.ceil(this.npcRespawnTimer))}s`;
-
-    const controls = this.isSettingsOpen
-      ? 'PAUSED  CONFIG: O'
-      : this.isInventoryOpen
-        ? 'PAUSED  INVENTORY: I'
-        : 'WASD MOVE  LMB/SPC ATTACK  Q/E/R SKILLS  I INV  O CFG  P SAVE';
+      ? (this.distanceToNpc() < TARGET_UI_RANGE
+        ? `TARGET HP: ${this.npcHealth}/${this.npcMaxHp}`
+        : '')
+      : `TARGET DOWN / RESPAWN ${Math.max(0, Math.ceil(this.npcRespawnTimer))}s`;
 
     const abilityStatus = this.glitching
       ? 'GLITCH ACTIVE'
       : this.overclockTimer > 0
-        ? `OVERCLOCK: ${Math.ceil(this.overclockTimer)}s`
-        : 'SYSTEM: NORMAL';
+        ? `OVERCLOCK ${Math.ceil(this.overclockTimer)}s`
+        : 'SYSTEM NORMAL';
 
-    const lines = [
-      { text: `FPS: ${Math.round(this.fps)}   //   AETHERGRID STATUS`, color: '#00ff9c' },
-      { text: `POS: X ${this.playerPos.x.toFixed(1)}   Z ${this.playerPos.z.toFixed(1)}`, color: '#00d4ff' },
-      { text: `PLAYER HP: ${this.playerHealth}/${maxHp}  ${hpBar}`, color: hpColor },
-      { text: enemyText, color: '#ff2fa0' },
-      { text: controls, color: '#65a88b' },
-      { text: `LV ${this.playerLevel}   EXP ${this.playerExp}/${this.expToNextLevel}   ATK ${this.getAttackDamage()}`, color: '#00ffff' },
-      { text: biomeText, color: BIOME_UI_COLORS[biome] ?? '#00ff9c' },
-      { text: `RAM: ${Math.floor(this.ram)}/${RAM_MAX}  ${ramBar}   ${abilityStatus}`, color: ramColor },
-      { text: `WPN: ${this.equippedWeapon?.name ?? '-'}   ARM: ${this.equippedArmor?.name ?? '-'}`, color: '#00d4ff' },
-      { text: this.messageTimer > 0 ? this.message : `Q BOMB ${BOMB_COST}   E BLINK ${BLINK_COST}   R OVRCLK ${OVERCLOCK_COST}`, color: this.messageTimer > 0 ? '#ffd028' : '#65a88b' },
+    const weaponName = this.equippedWeapon?.name ?? 'UNARMED';
+    const statusText = this.messageTimer > 0
+      ? `MSG: ${this.message}`
+      : `SYS: ${abilityStatus}`;
+
+    const controls = this.isSettingsOpen
+      ? 'PAUSED / CONFIG: O'
+      : this.isInventoryOpen
+        ? 'PAUSED / INVENTORY: I'
+        : 'WASD MOVE  LMB/SPC ATTACK  Q/E/R SKILLS';
+
+    const lines: Array<{ text: string; color: string }> = [
+      { text: border, color: '#00cfe8' },
+      { text: row(' SYS://AETHERGRID'), color: '#35eaff' },
+      { text: row(` FPS: ${Math.round(this.fps)}   POS: ${this.playerPos.x.toFixed(1)}, ${this.playerPos.z.toFixed(1)}`), color: '#ffd84d' },
+      { text: border, color: '#00cfe8' },
+      { text: row(` HP  ${makeBar(hpRatio, barWidth)} ${compact ? `${Math.round(hpRatio * 100)}%` : `${Math.ceil(this.playerHealth)}/${maxHp}`}`), color: hpColor },
+      { text: row(` RAM ${makeBar(ramRatio, barWidth)} ${compact ? `${Math.floor(ramRatio * 100)}%` : `${Math.floor(this.ram)}/${RAM_MAX}`}`), color: ramColor },
+      { text: row(` EXP ${makeBar(expRatio, barWidth)} ${compact ? `LV ${this.playerLevel}` : `${this.playerExp}/${this.expToNextLevel}  LV ${this.playerLevel}`}`), color: '#ffc857' },
+      { text: border, color: '#00cfe8' },
+      { text: row(` BIOME: ${biomeName}`), color: biomeColor },
+      { text: row(` ATK: ${this.getAttackDamage()}`), color: '#ffd84d' },
+      { text: row(` WPN: ${weaponName}`), color: this.equippedWeapon?.color ?? '#8fffd2' },
+      { text: row(` ${statusText}`), color: this.messageTimer > 0 ? '#ffd84d' : (this.glitching ? '#ff405f' : '#55e6a5') },
+      { text: row(` ${enemyText || controls}`), color: enemyText ? '#ff75b8' : '#72b99a' },
+      { text: border, color: '#00cfe8' },
     ];
 
-    this.renderer.drawHudOverlay(lines);
+    // The renderer draws this as a lightweight Canvas overlay after present(),
+    // using a dark fillRect background with alpha and responsive font sizing.
+    renderer.drawHudOverlay(lines);
   }
+
 }

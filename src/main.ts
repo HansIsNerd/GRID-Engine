@@ -1,10 +1,10 @@
+// src/main.ts
 import './style.css';
 import { Engine } from './engine/core/Engine';
+import { WebGLRenderer } from './engine/renderer/WebGLRenderer';
 
-const canvas = document.getElementById('game-canvas');
-if (!(canvas instanceof HTMLCanvasElement)) {
-  throw new Error('#game-canvas not found');
-}
-
-const engine = new Engine(canvas);
-engine.start();
+window.addEventListener('DOMContentLoaded', () => {
+  const canvas = document.getElementById('game-canvas') as HTMLCanvasElement;
+  const engine = new Engine(canvas);   
+  engine.start();
+});
